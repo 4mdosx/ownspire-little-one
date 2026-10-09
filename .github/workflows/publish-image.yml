@@ -1,0 +1,40 @@
+# 照 navi 那份改。差异只有两处：
+#   镜像名ownspire-little-one（与仓库名对齐）
+#   build-arg AGENT_VERSION —— Dockerfile 的 ARG 名字是这个，不是 LITTLE_ONE_VERSION
+#
+# infra 的 deploy 用 :main 与 7 位 commit 两个 tag，/healthz 靠 AGENT_VERSION 报版本。
+name: Publish image
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build image
+        run: |
+          sha="$(git rev-parse --short=7 HEAD)"
+          docker build --platform linux/amd64 \
+            --build-arg "AGENT_VERSION=${sha}" \
+            --tag "ghcr.io/4mdosx/ownspire-little-one:${sha}" \
+            --tag ghcr.io/4mdosx/ownspire-little-one:main \
+            .
+          echo "IMAGE_SHA=${sha}" >> "$GITHUB_ENV"
+
+      - name: Push image
+        run: |
+          docker push "ghcr.io/4mdosx/ownspire-little-one:${IMAGE_SHA}"
+          docker push ghcr.io/4mdosx/ownspire-little-one:main
