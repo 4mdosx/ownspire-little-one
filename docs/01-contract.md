@@ -150,11 +150,47 @@ GET /api/tools
 ### 枚举接口
 
 ```
-GET /api/healthz        → 见§二
+GET /api/healthz        → 见 §二
 GET /api/models         → { models: [{ id, label, provider }] }
+GET /api/config         → 见下面「配置目录」
 ```
 
 `/api/models` 让 raven 能在会话创建时选模型，而不用把模型列表硬编码在前端。
+
+### 配置目录（2026-10-09 新增）
+
+服务 raven 的「模型与厂商」管理界面。**加路由不算契约变更**（§八：加东西永远可以）。
+
+```
+GET    /api/config                          → 一次返回三段 + 当前默认模型
+PUT    /api/config/providers/:id           → 增改厂商（apiKey 可选，不传 = 不改）
+PUT    /api/config/endpoints/:id           → 增改端点
+PUT    /api/config/models                  → 增改模型（body 里带 endpointId）
+DELETE /api/config/providers/:id[?cascade=1]
+DELETE /api/config/endpoints/:id[?cascade=1]
+DELETE /api/config/models/:endpointId/:id
+```
+
+**一条不能破的：明文 key 永不出现在任何响应里。** 出口只有 `providers[].apiKeySet` /
+`apiKeySource` / `apiKeyHint`（末四位掩码）三个字段，连 `apiKey` 这个键都不存在。
+这不是「记得脱敏」，是做成了类型——想泄漏都泄漏不出去。
+
+`apiKeySource` 区分 `db`（界面填的）与 `env`（环境变量注入的），因为两者的修法不同：
+前者去界面改，后者要改部署配置。分不清的话用户会去改错地方。
+
+| 情况 | 状态码 | code |
+|---|---|---|
+| 厂商/端点下还有下级，且没给 `cascade` | 409 | `cascade_required` |
+| 参数不合法（协议名写错、`reasoningEffort` 不是 low/high/max） | 400 | `invalid_config` |
+| id 不存在 | 404 | `*_not_found` |
+
+⚠️ **409 与 400/404 必须分开**：409 的意思是「请求与当前状态冲突」，
+前端据此弹确认框；500 的意思是「服务端坏了」，前端只会显示「稍后重试」——
+而重试一万次也是同样的冲突。
+
+⚠️ **删除一律要求显式 `cascade=1`**，回执报清连带删了几个端点与模型。
+静默级联会让「我只想删这个厂商」变成「它的模型全没了」，而不可逆的动作没有回执
+是最糟的组合。
 
 ---
 

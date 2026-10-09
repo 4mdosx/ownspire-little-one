@@ -17,13 +17,25 @@ import { executeTurn, TurnError, type ApprovalResponseInput } from './protocol/t
 import { drivers } from './drivers/index.js'
 import { store } from './db/store.js'
 import {
+  CascadeRequiredError,
+  ConfigError,
   defaultModelId,
+  tryDefaultModelId,
+  deleteEndpoint,
+  deleteModel,
+  deleteProvider,
+  listEndpointRows,
   listEndpoints,
   listModels,
+  listProviderViews,
   missingKeys,
   ensureConfiguredModel,
   seedBuiltinProviders,
+  toProtocol,
   usableEndpoints,
+  upsertEndpoint,
+  upsertModel,
+  upsertProvider,
 } from './db/registry-store.js'
 import { toolCatalog, toolNames, UnknownToolError } from './tools/registry.js'
 import { loadRavenTools } from './tools/raven.js'
@@ -87,6 +99,151 @@ export function buildRouter(token: string): Router {
   router.get('/api/tools', ({ req, res }) => {
     requireAuth(req, token)
     sendJson(res, 200, { tools: toolCatalog() })
+  })
+
+  // ---- 配置目录（鉴权）：厂商 / 端点 / 模型 的增删改 ----------------
+  //
+  // ⚠️ 这组接口服务 raven 的「模型与厂商」管理界面。
+  //
+  // **一条不能破的：明文 key 永不出现在任何响应里。** 出口只有
+  // `listProviderViews()`那一个形状，它连apiKey 字段都没有 ——
+  // 「key 存在但不许出站」这条纪律做成了类型，而不是靠每个路由记得脱敏。
+  // 界面上要看key 状态，看 `apiKeySet` / `apiKeySource` / `apiKeyHint`。
+  //
+  // ⚠️ **写操作一律立即落库，不走「改配置要重启」那套缓存。**
+  // 目录层的缓存存在的理由是「一半请求用旧配置一半用新的很难查」，
+  // 而配置界面的整个意义就是「改完立刻能用」。
+  // 真正需要重启的是 key 那部分——它从库里读，不用重启。
+
+  router.get('/api/config', ({ req, res }) => {
+    requireAuth(req, token)
+    sendJson(res, 200, {
+      providers: listProviderViews(),
+      endpoints: listEndpointRows(),
+      models: listModels(),
+      // ⚠️ 用 try 版：刚删掉当前默认模型时，「查一下默认是谁」不该让整个查询失败。
+      // 「配置坏了」是用户的编辑结果，不是「这个接口出错」。
+      defaultModel: tryDefaultModelId(),
+    })
+  })
+
+  /** 配置类错误 → 400。用类型区分而不是匹配 message（那是把文案变成了控制流）。 */
+  function guardConfig<T>(fn: () => T): T {
+    try {
+      return fn()
+    } catch (error) {
+      if (error instanceof ConfigError) {
+        throw new HttpError(400, 'invalid_config', error.message)
+      }
+      if (error instanceof CascadeRequiredError) {
+        throw new HttpError(409, 'cascade_required', error.message)
+      }
+      throw error
+    }
+  }
+
+  router.put('/api/config/providers/:id', async ({ req, res, params }) => {
+    requireAuth(req, token)
+    const body = await readJson<{
+      label?: unknown
+      keyEnvVar?: unknown
+      defaultProtocol?: unknown
+      apiKey?: unknown
+      clearApiKey?: unknown
+    }>(req)
+    const id = requireId(params.id)
+    const existing = listProviderViews().find((item) => item.id === id)
+    guardConfig(() =>
+      upsertProvider({
+        id,
+        label: requireText(body.label, existing?.label ?? id),
+        keyEnvVar: requireText(body.keyEnvVar, existing?.keyEnvVar ?? `${id.toUpperCase()}_API_KEY`),
+        defaultProtocol:
+          typeof body.defaultProtocol === 'string'
+            ? toProtocol(body.defaultProtocol)
+            : (existing?.defaultProtocol ?? 'openai-chat-completions'),
+        // ⚠️ 字段不存在 = **不改**，不是清空。界面「保存」一个没碰 key 的表单
+        // 是常态，缺省等于清空的话用户改个标签就把 key 弄丢了。
+        ...(typeof body.apiKey === 'string' && body.apiKey.trim() !== '' ? { apiKey: body.apiKey } : {}),
+        ...(body.clearApiKey === true ? { clearApiKey: true } : {}),
+      })
+    )
+    sendJson(res, 200, { provider: listProviderViews().find((item) => item.id === id) })
+  })
+
+  router.put('/api/config/endpoints/:id', async ({ req, res, params }) => {
+    requireAuth(req, token)
+    const body = await readJson<Record<string, unknown>>(req)
+    const id = requireId(params.id)
+    // ⚠️ 这里要providerId（部分更新时回退到原厂商），而协议层的 EndpointConfig
+    // 不带它 —— 所以走界面专用的行视图。两个形状各有各的用处，别混用。
+    const existing = listEndpointRows().find((item) => item.id === id)
+    guardConfig(() =>
+      upsertEndpoint({
+        id,
+        providerId: requireText(body.providerId, existing?.providerId ?? ''),
+        label: requireText(body.label, existing?.label ?? id),
+        ...(typeof body.protocol === 'string'
+          ? { protocol: toProtocol(body.protocol) }
+          : existing?.protocol
+            ? { protocol: existing.protocol }
+            : {}),
+        ...(typeof body.baseUrl === 'string' ? { baseUrl: body.baseUrl } : {}),
+        ...(body.extraBody !== undefined && body.extraBody !== null
+          ? { extraBody: body.extraBody as Record<string, unknown> }
+          : {}),
+        ...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
+      })
+    )
+    sendJson(res, 200, { endpoint: listEndpointRows().find((item) => item.id === id) })
+  })
+
+  router.put('/api/config/models', async ({ req, res }) => {
+    requireAuth(req, token)
+    const body = await readJson<Record<string, unknown>>(req)
+    const id = requireText(body.id, '')
+    const endpointId = requireText(body.endpointId, '')
+    const existing = listModels().find((item) => item.id === id && item.endpointId === endpointId)
+    guardConfig(() =>
+      upsertModel({
+        id,
+        endpointId,
+        label: requireText(body.label, existing?.label ?? id),
+        ...(typeof body.reasoningEffort === 'string'
+          ? { reasoningEffort: body.reasoningEffort as 'low' | 'high' | 'max' }
+          : existing?.reasoningEffort
+            ? { reasoningEffort: existing.reasoningEffort as 'low' | 'high' | 'max' }
+            : {}),
+        ...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
+      })
+    )
+    sendJson(res, 200, { model: listModels().find((item) => item.id === id && item.endpointId === endpointId) })
+  })
+
+  // ⚠️ **删除一律要求显式 cascade**，且回执里报清连带删了什么。
+  // 静默级联会让「我只是想删这个厂商」变成「它的模型全没了」，
+  // 而不可逆的动作没有回执是最糟的组合。
+  router.delete('/api/config/providers/:id', ({ req, res, params }) => {
+    requireAuth(req, token)
+    const id = requireId(params.id)
+    const result = guardCascade(() => deleteProvider(id, cascadeOf(req)))
+    if (!result.deleted) throw new HttpError(404, 'provider_not_found', `厂商 ${id} 不存在。`)
+    sendJson(res, 200, { ...result, defaultModel: tryDefaultModelId() })
+  })
+
+  router.delete('/api/config/endpoints/:id', ({ req, res, params }) => {
+    requireAuth(req, token)
+    const id = requireId(params.id)
+    const result = guardCascade(() => deleteEndpoint(id, cascadeOf(req)))
+    if (!result.deleted) throw new HttpError(404, 'endpoint_not_found', `端点 ${id} 不存在。`)
+    sendJson(res, 200, result)
+  })
+
+  router.delete('/api/config/models/:endpointId/:id', ({ req, res, params }) => {
+    requireAuth(req, token)
+    const removed = deleteModel(requireId(params.id), requireId(params.endpointId))
+    if (!removed) throw new HttpError(404, 'model_not_found', `模型 ${params.id} 不存在。`)
+    sendJson(res, 200, { deleted: true })
   })
 
   // ---- 会话（契约 §三）------------------------------------------------------
@@ -240,7 +397,102 @@ export function buildRouter(token: string): Router {
   return router
 }
 
+/**
+ * 路径里的 id。空串或带斜杠的一律拒 —— 它们在 SQL 与文件路径里的含义都不干净。
+ *
+ * ⚠️ 参数类型是 `string | undefined`：`params` 是 `Record<string, string>`，
+ * 而 tsconfig 开了 `noUncheckedIndexedAccess`，所以索引访问可能是 undefined。
+ * 与其到处写 `params.id ?? ''`，不如在这里把「缺参数」当成非法 id 处理 ——
+ * 它本来就该被拒。
+ */
+function requireId(raw: string | undefined): string {
+  const id = (raw ?? '').trim()
+  if (id === '' || id.includes('/')) {
+    throw new HttpError(400, 'invalid_id', `非法的 id：${JSON.stringify(raw ?? '')}`)
+  }
+  return id
+}
+
+/** 字段必须是非空字符串；没给就回退到现值（部分更新语义）。 */
+function requireText(value: unknown, fallback: string): string {
+  if (value === undefined || value === null) {
+    if (fallback === '') throw new HttpError(400, 'missing_field', '这个字段是必填的。')
+    return fallback
+  }
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new HttpError(400, 'invalid_field', '这个字段必须是非空字符串。')
+  }
+  return value.trim()
+}
+
+/**
+ * 级联删除的开关。**只能是显式的 `cascade=1`/`true`** ——
+ * 缺省一律当「不级联」，然后由下层报「还有 N 个端点/模型」并让用户确认。
+ * 反过来（缺省就级联）的话，一次误点就没了，而用户看不到自己误点了什么。
+ */
+function cascadeOf(req: http.IncomingMessage): boolean {
+  const raw = new URL(req.url ?? '/', 'http://localhost').searchParams.get('cascade')
+  return raw === '1' || raw === 'true'
+}
+
+/**
+ * 把「还有下级」翻成 **409**。
+ *
+ * ⚠️ 必须是 409 而不是落回500：500 的意思是「服务端坏了」，而这里服务端好得很，
+ * 是请求与当前状态冲突。raven 拿到 409 才知道「该弹确认框问用户」，
+ * 拿到 500 只会显示一句「稍后重试」—— 而重试一万次也是同样的冲突。
+ */
+function guardCascade<T>(fn: () => T): T {
+  try {
+    return fn()
+  } catch (error) {
+    if (error instanceof CascadeRequiredError) {
+      throw new HttpError(409, 'cascade_required', error.message)
+    }
+    throw error
+  }
+}
+
 /** 启动前检查。`ensureSchema` 幂等，撞到旧表直接抛错不自动搬数据。 */
+/**
+ * 把 Router 接成 Node 的 request listener。
+ *
+ * ⚠️ **导出来是为了让验证脚本走同一份接线** —— 之前这段内联在 `startServer` 里，
+ * 于是 `scripts/protocol/verify-config-api.ts` 只能自己拼一个 listener，
+ * 而拼错的那次症状是「请求发出去没响应、脚本挂到超时」——
+ * 一个看起来像测试环境问题、实际是接线写错的问题。
+ * 同一份接线有两次实现时，第二次一定会走偏。
+ */
+export function createRequestListener(router: Router): http.RequestListener {
+  return (req, res) => {
+    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
+
+    const matched = router.match(req.method ?? 'GET', url.pathname)
+    if (!matched) {
+      sendJson(res, 404, { code: 'not_found', error: `没有这个接口：${url.pathname}` })
+      return
+    }
+
+    // ⚠️ handler 可能是同步函数（鉴权就在最前面，是同步 throw）。
+    // 所以必须用 `Promise.resolve().then(() => handler(...))` 把**调用本身**
+    // 包进微任务 —— 直接 `Promise.resolve(handler(...))` 的话，
+    // 同步 throw 会在 Promise 构造之前就发生，catch 抓不到。
+    // 症状是：401变成进程级 uncaughtException，连接被直接断掉（curl 拿到 000）。
+    void Promise.resolve()
+      .then(() => matched.handler({ req, res, params: matched.params, query: url.searchParams }))
+      .catch((error) => {
+        if (res.headersSent) {
+          // 头已发出（流已开始），状态码改不了 —— 这个错误由
+          // createAgentStream 的 catch 作为 `run.failed` 送出去了。
+          // 这里只结束响应，不能再 sendError。
+          res.end()
+          return
+        }
+        sendError(res, error)
+      })
+  }
+}
+
 export function bootstrap(): { interrupted: number } {
   ensureSchema()
   // ⚠️ **先建目录再检查配置** —— 内置的厂商/端点是在库里的，
@@ -305,33 +557,7 @@ export async function startServer(): Promise<http.Server> {
   const router = buildRouter(token)
   const listenPort = port()
 
-  const server = http.createServer((req, res) => {
-    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
-
-    const matched = router.match(req.method ?? 'GET', url.pathname)
-    if (!matched) {
-      sendJson(res, 404, { code: 'not_found', error: `没有这个接口：${url.pathname}` })
-      return
-    }
-
-    // ⚠️ handler 可能是同步函数（鉴权就在最前面，是同步 throw）。
-    // 所以必须用 `Promise.resolve().then(() => handler(...))` 把**调用本身**
-    // 包进微任务 —— 直接 `Promise.resolve(handler(...))` 的话，
-    // 同步 throw 会在 Promise 构造之前就发生，catch 抓不到。
-    // 症状是：401变成进程级 uncaughtException，连接被直接断掉（curl 拿到 000）。
-    void Promise.resolve()
-      .then(() => matched.handler({ req, res, params: matched.params, query: url.searchParams }))
-      .catch((error) => {
-        if (res.headersSent) {
-          // 头已发出（流已开始），状态码改不了 —— 这个错误由
-          // createAgentStream 的 catch 作为 `run.failed` 送出去了。
-          // 这里只结束响应，不能再 sendError。
-          res.end()
-          return
-        }
-        sendError(res, error)
-      })
-  })
+  const server = http.createServer(createRequestListener(router))
 
   server.listen(listenPort, () => {
     console.log(`[agent] 监听 ${listenPort}，契约 v${CONTRACT_VERSION}，模型 ${defaultModelId()}，工具 ${toolNames().length} 个。`)

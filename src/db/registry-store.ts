@@ -66,7 +66,7 @@ export function toProtocol(raw: string): ProtocolFamily {
     'sdk',
   ]
   if (!known.includes(raw as ProtocolFamily)) {
-    throw new Error(
+    throw new ConfigError(
       `protocol 写错了：${raw}。合法的值是 ${known.join(' / ')}。` +
         '⚠️ 它是**协议名**不是厂商名 —— GLM 与 OpenAI 官方都是 openai-chat-completions。'
     )
@@ -101,7 +101,7 @@ export function resolveProviderKey(row: { apiKey?: string | null; keyEnvVar: str
 
 function toEndpoint(row: EndpointRow): EndpointConfig {
   if (!row.providerKeyEnvVar) {
-    throw new Error(`端点 ${row.id} 关联的厂商 ${row.providerId} 不存在。数据不完整。`)
+    throw new ConfigError(`端点 ${row.id} 关联的厂商 ${row.providerId} 不存在。数据不完整。`)
   }
   const apiKey = resolveProviderKey({ apiKey: row.providerApiKey, keyEnvVar: row.providerKeyEnvVar })
   return {
@@ -120,7 +120,7 @@ function toEndpoint(row: EndpointRow): EndpointConfig {
 function toModel(row: ModelRow): ModelConfig {
   const effort = row.reasoningEffort
   if (effort !== null && effort !== 'low' && effort !== 'high' && effort !== 'max') {
-    throw new Error(`模型 ${row.id} 的 reasoningEffort 写错了：${effort}。只能是 low / high / max。`)
+    throw new ConfigError(`模型 ${row.id} 的 reasoningEffort 写错了：${effort}。只能是 low / high / max。`)
   }
   return {
     id: row.id,
@@ -224,6 +224,49 @@ export function listProviderViews(): ProviderView[] {
   return listProviders().map(providerView)
 }
 
+/**
+ * 给管理界面用的端点行 —— **带 providerId，而协议层的 EndpointConfig 不带**。
+ *
+ * 界面要按厂商分组、部分更新时要回退到原来的厂商，两者都需要它；
+ * 而 Adapter 用不到，所以它不进协议层。
+ */
+export type EndpointRowView = {
+  id: string
+  providerId: string
+  label: string
+  protocol: ProtocolFamily
+  baseUrl: string | null
+  extraBody: Record<string, unknown> | null
+  enabled: number
+  modelCount: number
+}
+
+export function listEndpointRows(): EndpointRowView[] {
+  return all<{
+    id: string
+    providerId: string
+    label: string
+    protocol: string | null
+    baseUrl: string | null
+    extraBody: string | null
+    enabled: number
+    providerDefaultProtocol: string
+  }>(
+    `SELECT e.*, p.defaultProtocol AS providerDefaultProtocol
+       FROM endpoints e JOIN providers p ON p.id = e.providerId
+      ORDER BY p.label, e.label`
+  ).map((row) => ({
+    id: row.id,
+    providerId: row.providerId,
+    label: row.label,
+    protocol: toProtocol(row.protocol ?? row.providerDefaultProtocol ?? 'openai-chat-completions'),
+    baseUrl: row.baseUrl,
+    extraBody: row.extraBody ? (JSON.parse(row.extraBody) as Record<string, unknown>) : null,
+    enabled: row.enabled,
+    modelCount: countModelsOn(row.id),
+  }))
+}
+
 // ---------------------------------------------------------------------------
 // 写
 // ---------------------------------------------------------------------------
@@ -246,7 +289,7 @@ export function upsertProvider(input: {
 }): void {
   toProtocol(input.defaultProtocol)
   if (input.clearApiKey && input.apiKey) {
-    throw new Error('clearApiKey 与 apiKey 不能同时给 —— 清空和设置是相反的意图。')
+    throw new ConfigError('clearApiKey 与 apiKey 不能同时给 —— 清空和设置是相反的意图。')
   }
   const current = get<{ apiKey: string | null }>('SELECT apiKey FROM providers WHERE id = :id', { id: input.id })
   const nextApiKey = input.clearApiKey
@@ -290,7 +333,7 @@ export function upsertEndpoint(input: {
   // ⚠️ 外键：厂商不存在就报错，而不是让端点挂在一个空引用上 ——
   // 后者的症状是「key 永远读不到」，而报错点在别处。
   if (!get<{ id: string }>('SELECT id FROM providers WHERE id = :id', { id: input.providerId })) {
-    throw new Error(`端点 ${input.id} 引用了不存在的厂商 ${input.providerId}。`)
+    throw new ConfigError(`端点 ${input.id} 引用了不存在的厂商 ${input.providerId}。`)
   }
   run(
     `INSERT INTO endpoints (id, providerId, label, protocol, baseUrl, extraBody, enabled, createdAt, updatedAt)
@@ -318,7 +361,7 @@ export function upsertEndpoint(input: {
 
 export function upsertModel(input: ModelConfig & { enabled?: boolean }): void {
   if (input.reasoningEffort !== undefined && !['low', 'high', 'max'].includes(input.reasoningEffort)) {
-    throw new Error(`reasoningEffort 只能是 low / high / max，收到「${input.reasoningEffort}」。`)
+    throw new ConfigError(`reasoningEffort 只能是 low / high / max，收到「${input.reasoningEffort}」。`)
   }
   run(
     `INSERT INTO models (id, endpointId, label, reasoningEffort, enabled, createdAt, updatedAt)
@@ -337,6 +380,116 @@ export function upsertModel(input: ModelConfig & { enabled?: boolean }): void {
       ts: now(),
     },
   )
+}
+
+// ---------------------------------------------------------------------------
+// 删
+// ---------------------------------------------------------------------------
+
+/**
+ * 「用户给的数据不合法」。
+ *
+ * ⚠️ 为什么要一个类：这些校验散落在 db 层（协议名、reasoningEffort、id 重复、
+ * 相反的两个 flag），而 HTTP 层要把它们翻成 **400**。
+ * 落回通用 Error 就是 500 —— 而 500 的意思是「服务端坏了，请重试」，
+ * 于是用户对着一个「参数写错了」重试一万次。
+ *
+ * 同理不能用 message 匹配来区分：那是把显示文案变成了控制流，
+ * 改一次文案就悄悄改了状态码。
+ */
+export class ConfigError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ConfigError'
+  }
+}
+
+/**
+ * 「还有下级，要删就显式声明 cascade」。
+ *
+ * ⚠️ 单独一个类而不是通用 Error：路由要把它翻成 **409 Conflict**，
+ * 而「参数不合法」是400、「服务端坏了」是 500。用 message 匹配来区分
+ * 是把一个显示文案变成了控制流 —— 改一次文案就悄悄改了 HTTP 状态码。
+ */
+export class CascadeRequiredError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'CascadeRequiredError'
+  }
+}
+
+/**
+ * 删除模型。
+ *
+ * ⚠️ **外键是声明了但没开的**（`PRAGMA foreign_keys` 默认 off，
+ * 而打开它会让 seed 阶段的插入顺序变成硬约束）。所以级联必须**显式做** ——
+ * 不做的话会留下指向不存在端点的模型行，而症状出现在很久之后：
+ * 用户在界面里选那个模型，Runtime 才说「找不到端点」。
+ */
+export function deleteModel(id: string, endpointId: string): boolean {
+  const row = get<{ n: number }>(
+    'SELECT count(*) AS n FROM models WHERE id = :id AND endpointId = :endpointId',
+    { id, endpointId }
+  )
+  if (!row || row.n === 0) return false
+  run('DELETE FROM models WHERE id = :id AND endpointId = :endpointId', { id, endpointId })
+  return true
+}
+
+/** 删端点前先报一下会连带删掉几个模型 —— 让调用方能把这句话转给用户。 */
+export function countModelsOn(endpointId: string): number {
+  const row = get<{ n: number }>('SELECT count(*) AS n FROM models WHERE endpointId = :id', { id: endpointId })
+  return row?.n ?? 0
+}
+
+export function deleteEndpoint(id: string, cascade: boolean): { deleted: boolean; removedModels: number } {
+  const models = countModelsOn(id)
+  const exists = get<{ n: number }>('SELECT count(*) AS n FROM endpoints WHERE id = :id', { id })
+  if (!exists || exists.n === 0) return { deleted: false, removedModels: 0 }
+  // ⚠️ 不给 cascade 就拒绝，**不静默连带删** —— 删端点连带删掉几个模型
+  // 是一次不可逆的动作，用户可能只以为删了一个地址。
+  if (models > 0 && !cascade) {
+    throw new CascadeRequiredError(`端点 ${id} 上还有 ${models} 个模型。要一起删请显式声明 cascade。`)
+  }
+  if (cascade) run('DELETE FROM models WHERE endpointId = :id', { id })
+  run('DELETE FROM endpoints WHERE id = :id', { id })
+  return { deleted: true, removedModels: models }
+}
+
+export function countEndpointsOn(providerId: string): number {
+  const row = get<{ n: number }>('SELECT count(*) AS n FROM endpoints WHERE providerId = :id', {
+    id: providerId,
+  })
+  return row?.n ?? 0
+}
+
+/**
+ * 删厂商。**级联删端点，端点再级联删模型** —— 但仍要显式声明。
+ *
+ * ⚠️ 为什么不静默级联：删厂商通常意味着「这个厂商不用了」，
+ * 而用户可能不知道它的端点下还挂着模型。报出数量让他确认，比替他决定好。
+ */
+export function deleteProvider(
+  id: string,
+  cascade: boolean
+): { deleted: boolean; removedEndpoints: number; removedModels: number } {
+  const endpoints = countEndpointsOn(id)
+  const exists = get<{ n: number }>('SELECT count(*) AS n FROM providers WHERE id = :id', { id })
+  if (!exists || exists.n === 0) return { deleted: false, removedEndpoints: 0, removedModels: 0 }
+  if (endpoints > 0 && !cascade) {
+    throw new CascadeRequiredError(`厂商 ${id} 下还有 ${endpoints} 个端点。要一起删请显式声明 cascade。`)
+  }
+  let removedModels = 0
+  if (cascade) {
+    removedModels = get<{ n: number }>(
+      'SELECT count(*) AS n FROM models WHERE endpointId IN (SELECT id FROM endpoints WHERE providerId = :id)',
+      { id }
+    )?.n ?? 0
+    run('DELETE FROM models WHERE endpointId IN (SELECT id FROM endpoints WHERE providerId = :id)', { id })
+    run('DELETE FROM endpoints WHERE providerId = :id', { id })
+  }
+  run('DELETE FROM providers WHERE id = :id', { id })
+  return { deleted: true, removedEndpoints: endpoints, removedModels }
 }
 
 // ---------------------------------------------------------------------------
@@ -458,7 +611,7 @@ export function ensureConfiguredModel(): void {
 
   const endpoint = listEndpoints()[0]
   if (!endpoint) {
-    throw new Error(
+    throw new ConfigError(
       `AGENT_MODEL 指定了「${configured}」，但一个启用的端点都没有。` +
         '先建厂商与端点（见 seedBuiltinProviders），或清掉 AGENT_MODEL。'
     )
@@ -470,6 +623,24 @@ export function ensureConfiguredModel(): void {
   )
 }
 
+/**
+ * 默认模型 id，**但拿不到就返回 null 而不是抛**。
+ *
+ * ⚠️ 存在的理由：删掉当前默认模型时，`defaultModelId()` 会抛
+ * 「AGENT_MODEL 指向的模型不在 models 表里」。而那是**删除操作的正确后果**，
+ * 不是删除操作的失败 —— 让它冒泡会把 200 变成 500，
+ * 用户看到的是「删除报错」，而实际上模型已经删掉了。
+ *
+ * 该抛的地方仍然抛（`startServer` 启动检查要的就是那个错）。
+ */
+export function tryDefaultModelId(): string | null {
+  try {
+    return defaultModelId() || null
+  } catch {
+    return null
+  }
+}
+
 export function defaultModelId(): string {
   const configured = process.env.AGENT_MODEL?.trim()
   if (configured) {
@@ -477,7 +648,7 @@ export function defaultModelId(): string {
     if (found) return found.id
     // ⚠️ **配了但库里没有 → 明确说出来**，不静默退到别的模型。
     // 静默退化会让「我明明设了 glm-5.3 却用的是别的」变成一桩查不到的事。
-    throw new Error(
+    throw new ConfigError(
       `AGENT_MODEL 指向的模型「${configured}」不在 models 表里。` +
         '确认 endpoints / models 表，或清掉这个变量让它用默认。'
     )

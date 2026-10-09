@@ -76,6 +76,11 @@ export type ProtocolFamily =
  * 协议层任何代码都不读它、不写进错误信息、不打日志。
  * 之所以要搬进来，是因为 key 的来源变成了两处（库里 / 环境变量），
  * 而**优先级只能有一个地方判**。分散在 driver 里判等于没有规则。
+ *
+ * ⚠️ 顺带一条同源的纪律：**这里也没有 providerId** —— Adapter 不需要知道
+ * 端点属于哪家厂商（key 通过 apiKey 拿，协议通过 protocol 定）。
+ * 界面要按厂商分组时用 registry-store 的行视图，那是给界面看的，不是协议层的输入。
+ * **协议层不解释的字段，就不该在协议层出现。**
  */
 export type EndpointConfig = {
   /** 端点 id，如 `zhipu` / `deepseek`。**只是标识，不决定用哪个 Adapter。** */

@@ -10,14 +10,15 @@
     "dev": "node --import tsx --watch src/main.ts",
     "start": "node --import tsx src/main.ts",
     "typecheck": "tsc --noEmit --incremental false",
-    "verify": "npm run verify:purity && npm run verify:protocol && npm run verify:tool-protocol && npm run verify:driver && npm run verify:registry",
+    "verify": "npm run verify:purity && npm run verify:protocol && npm run verify:tool-protocol && npm run verify:driver && npm run verify:registry && npm run verify:config-api",
     "verify:purity": "node --import tsx scripts/verify-protocol-purity.ts",
     "verify:protocol": "node --import tsx scripts/protocol/verify-turn.ts",
     "verify:driver": "node --import tsx scripts/drivers/verify-vercel-ai.ts",
     "verify:registry": "node --import tsx scripts/registry/verify-registry.ts",
     "verify:gateway": "node --import tsx scripts/verify-gateway.ts",
     "verify:stream": "node --import tsx scripts/verify-stream.ts",
-    "verify:tool-protocol": "node --import tsx scripts/protocol/verify-tool-protocol.ts"
+    "verify:tool-protocol": "node --import tsx scripts/protocol/verify-tool-protocol.ts",
+    "verify:config-api": "node --import tsx scripts/protocol/verify-config-api.ts"
   },
   "dependencies": {
     "@ai-sdk/openai": "^3.0.0",

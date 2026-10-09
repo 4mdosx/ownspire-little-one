@@ -113,6 +113,9 @@ export class Router {
   post(path: string, handler: Handler): this {
     return this.add('POST', path, handler)
   }
+  put(path: string, handler: Handler): this {
+    return this.add('PUT', path, handler)
+  }
   delete(path: string, handler: Handler): this {
     return this.add('DELETE', path, handler)
   }
