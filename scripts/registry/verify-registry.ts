@@ -28,6 +28,7 @@ const {
   listEndpoints,
   listModels,
   listProviders,
+  listProviderViews,
   missingKeys,
   seedBuiltinProviders,
   upsertEndpoint,
@@ -79,11 +80,79 @@ function main(): void {
     defaultProtocol: 'openai-chat-completions',
   })
   check('厂商建出来后能列出', listProviders().some((p) => p.id === 'zhipu'))
+
+  // ⚠️ 这里守的是**出站脱敏**，不是「库里没有 key」（2026-10-09 裁定 key 入库）。
+  // 纪律换了位置：以前是「key 不许存在」，现在是「key 存在但不许出站」。
+  // 断言的对象必须是**类型**而不是人的记性 —— 让想泄漏都泄漏不出去。
+  upsertProvider({
+    id: 'zhipu',
+    label: '智谱 GLM',
+    keyEnvVar: 'ZHIPU_API_KEY',
+    defaultProtocol: 'openai-chat-completions',
+    apiKey: 'sk-test-abcdefgh1234',
+  })
+  const view = listProviderViews().find((p) => p.id === 'zhipu')
+  check('库里确实存了 key（裁定如此）', listProviders().find((p) => p.id === 'zhipu')?.apiKey !== null)
+  check('出站视图不含apiKey 字段', view !== undefined && !('apiKey' in view), Object.keys(view ?? {}))
   check(
-    '**库里没有 key 列**（凭据只在环境里）',
-    !Object.keys(listProviders()[0] ?? {}).includes('apiKey'),
-    Object.keys(listProviders()[0] ?? {}),
+    '出站视图只给末四位掩码',
+    view?.apiKeyHint === '****1234',
+    view?.apiKeyHint
   )
+  check('出站视图标明 key 已配置', view?.apiKeySet === true)
+  check('出站视图标明来源是库', view?.apiKeySource === 'db', view?.apiKeySource)
+  // ⚠️ 真正的泄漏防线：**把整个响应序列化一遍搜字符串**。
+  // 只检查字段在不在是不够的 —— key 可能藏在别的字段里、被日志带出去、
+  // 或者某个字段名换了个马甲。搜字符串是唯一能覆盖全部情况的办法。
+  check(
+    '⚠️ 整个出站对象的 JSON 里搜不到 key 明文',
+    !JSON.stringify(listProviderViews()).includes('sk-test-abcdefgh1234')
+  )
+
+  // ⚠️ 改个标签不该把 key 弄丢 —— 「保存没碰 key 的表单」是界面上的常态。
+  // 缺省等于清空的话，用户改个标签就会突然报 key 无效，而完全想不到是自己干的。
+  upsertProvider({
+    id: 'zhipu',
+    label: '智谱 GLM（改名）',
+    keyEnvVar: 'ZHIPU_API_KEY',
+    defaultProtocol: 'openai-chat-completions',
+  })
+  check(
+    '只改标签时 key 保持不变',
+    listProviders().find((p) => p.id === 'zhipu')?.apiKey === 'sk-test-abcdefgh1234'
+  )
+  upsertProvider({
+    id: 'zhipu',
+    label: '智谱 GLM（改名）',
+    keyEnvVar: 'ZHIPU_API_KEY',
+    defaultProtocol: 'openai-chat-completions',
+    clearApiKey: true,
+  })
+  check(
+    'clearApiKey 才真的清掉',
+    listProviders().find((p) => p.id === 'zhipu')?.apiKey === null
+  )
+  try {
+    upsertProvider({
+      id: 'zhipu',
+      label: 'x',
+      keyEnvVar: 'X',
+      defaultProtocol: 'openai-chat-completions',
+      apiKey: 'a',
+      clearApiKey: true,
+    })
+    check('同时给 apiKey 与 clearApiKey 应报错（相反的意图）', false)
+  } catch {
+    check('同时给 apiKey 与 clearApiKey 应报错（相反的意图）', true)
+  }
+  // 恢复成无 key 状态，免得影响后面的用例
+  upsertProvider({
+    id: 'zhipu',
+    label: '智谱 GLM',
+    keyEnvVar: 'ZHIPU_API_KEY',
+    defaultProtocol: 'openai-chat-completions',
+    clearApiKey: true,
+  })
 
   console.log('\n[协议挂在端点上]')
   // 智谱的现实情况：同一家厂商、同一个 key，三个端点两种协议。

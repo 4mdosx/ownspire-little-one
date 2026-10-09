@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { resolveDbFile } from '../config/env.js'
-import { LEGACY_INDEXES, LEGACY_TABLES, SCHEMA_SQL } from './schema.js'
+import { LEGACY_INDEXES, LEGACY_TABLES, MIGRATABLE_COLUMNS, SCHEMA_SQL } from './schema.js'
 
 /**
  * 连接与初始化。规矩来自 atlas / raven，都是踩过的：
@@ -66,8 +66,20 @@ export function ensureSchema(): void {
   }
   database.exec(SCHEMA_SQL)
   // ⚠️ **`CREATE TABLE IF NOT EXISTS` 对已存在的表不做任何事。**
-  // 所以 schema.sql 里改了约束，库里那张表不会跟着变 —— 而服务照样起来，
-  // 于是继续跑着旧逻辑的 bug。必须显式查索引，把沉默的不一致变成启动错误。
+  // 所以 schema.sql 里加了列，库里那张表不会跟着变 —— 而服务照样起来，
+  // 于是读那一列的代码全拿到 undefined。这类沉默的不一致最难查。
+  //
+  // 缺列是**唯一可以自动修**的一类：`ALTER TABLE ADD COLUMN` 是纯加法，
+  // 不动已有行、不动索引、不可能失败。撞上旧表结构/旧约束仍然拒绝启动
+  // （见上面那段），因为那些要对数据动手术。
+  for (const item of MIGRATABLE_COLUMNS) {
+    const columns = database.prepare(`PRAGMA table_info(${item.table})`).all() as Array<{ name: string }>
+    if (columns.some((column) => column.name === item.column)) continue
+    database.exec(item.ddl)
+    console.log(`[agent] 已迁移：${item.table} 补上 ${item.column} —— ${item.reason}`)
+  }
+  // ⚠️ 索引也要查，不只是表：改了 schema 里的约束不等于库里的约束变了，
+  // 而后者只在索引层面看得出来。
   for (const [index, reason] of Object.entries(LEGACY_INDEXES)) {
     const found = database
       .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name = ?")

@@ -389,9 +389,11 @@ function providerOptionsFor(request: DriverRequest): { providerOptions?: Record<
 function defaultModelFactory(request: DriverRequest): LanguageModel {
   const provider = createOpenAI({
     ...(request.endpoint.baseUrl ? { baseURL: request.endpoint.baseUrl } : {}),
-    // ⚠️ key 从环境变量取，且**缺失时让 SDK 自己报错** ——
-    // 那条错误信息会指出缺哪个变量名，比自己编一句「模型调用失败」有用。
-    apiKey: process.env[request.endpoint.keyEnvVar],
+    // ⚠️ key 已经在 db 层解析好了（库里填的优先，环境变量兜底）。
+    // 两处都没有时是 undefined —— **让它原样传给 SDK**，
+    // 那条错误信息会指出这个厂商没配 key，而我们自己编的话
+    // 只能说出变量名，说不出「也可以在管理界面里填」。
+    apiKey: request.endpoint.apiKey,
   })
   return provider.chat(request.model.id)
 }

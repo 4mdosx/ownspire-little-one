@@ -26,7 +26,10 @@ type ProviderRow = {
   id: string
   label: string
   keyEnvVar: string
+  apiKey: string | null
   defaultProtocol: string
+  createdAt: number
+  updatedAt: number
 }
 
 type EndpointRow = {
@@ -39,6 +42,7 @@ type EndpointRow = {
   enabled: number
   providerLabel?: string
   providerKeyEnvVar?: string
+  providerApiKey?: string | null
   providerDefaultProtocol?: string
 }
 
@@ -73,13 +77,33 @@ export function toProtocol(raw: string): ProtocolFamily {
 /** 一次 JOIN 把端点与厂商都取出来 —— key 在厂商上，不在端点上。 */
 const ENDPOINT_SELECT = `
   SELECT e.*, p.label AS providerLabel, p.keyEnvVar AS providerKeyEnvVar,
+         p.apiKey AS providerApiKey,
          p.defaultProtocol AS providerDefaultProtocol
     FROM endpoints e JOIN providers p ON p.id = e.providerId`
+
+/**
+ * key 的取值优先级 —— **全项目只有这一处判**。
+ *
+ * 库里填的（管理界面）优先，环境变量兜底（容器部署的既有方式）。
+ * 顺序反过来的后果是：容器里注入的 env 会盖掉用户在界面上刚填的 key，
+ * 而界面显示「已保存」—— 那比不提供界面更糟。
+ *
+ * ⚠️ 两者都没有时返回 undefined，**不返回空字符串**：
+ * SDK 用 `undefined` 报「缺少凭据」，而空字符串会被它当成「有一把空 key」
+ * 于是请求照发、拿回一个语焉不详的 401。
+ */
+export function resolveProviderKey(row: { apiKey?: string | null; keyEnvVar: string }): string | undefined {
+  const fromDb = row.apiKey?.trim()
+  if (fromDb) return fromDb
+  const fromEnv = process.env[row.keyEnvVar]?.trim()
+  return fromEnv ? fromEnv : undefined
+}
 
 function toEndpoint(row: EndpointRow): EndpointConfig {
   if (!row.providerKeyEnvVar) {
     throw new Error(`端点 ${row.id} 关联的厂商 ${row.providerId} 不存在。数据不完整。`)
   }
+  const apiKey = resolveProviderKey({ apiKey: row.providerApiKey, keyEnvVar: row.providerKeyEnvVar })
   return {
     id: row.id,
     label: row.label,
@@ -88,6 +112,7 @@ function toEndpoint(row: EndpointRow): EndpointConfig {
     ...(row.baseUrl ? { baseUrl: row.baseUrl } : {}),
     // key 的环境变量名**从厂商取** —— 端点不持有凭据。
     keyEnvVar: row.providerKeyEnvVar,
+    ...(apiKey ? { apiKey } : {}),
     ...(row.extraBody ? { extraBody: JSON.parse(row.extraBody) as Record<string, unknown> } : {}),
   }
 }
@@ -152,25 +177,102 @@ export function listProviders(): ProviderRow[] {
 }
 
 // ---------------------------------------------------------------------------
+// 出口：脱敏视图
+// ---------------------------------------------------------------------------
+
+/**
+ * **出站用的厂商形状 —— 唯一允许发给 raven 的那个。**
+ *
+ * ⚠️ 为什么要有这个而不是「HTTP 层记得脱敏」：
+ * 「记得」这种约束在下一个人改路由时就失效了，而 key 一旦进过一次响应，
+ * 它就进了浏览器的 devtools、前端的日志、以及任何抓包工具。
+ * 把「不包含明文 key」做成一个**类型**，让想泄漏都泄漏不出去。
+ *
+ * `apiKeyHint` 只给末四位。够用户确认「我填的是不是那把」，不足以还原。
+ */
+export type ProviderView = {
+  id: string
+  label: string
+  /** 兜底的环境变量名。界面上要显示它 —— 用户得知道还能从哪儿配。 */
+  keyEnvVar: string
+  /** key 是否已配置（库里或环境变量里任一处有）。 */
+  apiKeySet: boolean
+  /** key 来源。分清「界面上填的」与「环境变量注入的」，否则用户会去改错地方。 */
+  apiKeySource: 'db' | 'env' | 'none'
+  apiKeyHint: string | null
+  defaultProtocol: ProtocolFamily
+  updatedAt: number
+}
+
+export function providerView(row: ProviderRow): ProviderView {
+  const fromDb = row.apiKey?.trim() ?? ''
+  const fromEnv = !fromDb ? (process.env[row.keyEnvVar]?.trim() ?? '') : ''
+  const effective = fromDb || fromEnv
+  return {
+    id: row.id,
+    label: row.label,
+    keyEnvVar: row.keyEnvVar,
+    apiKeySet: effective !== '',
+    apiKeySource: fromDb ? 'db' : fromEnv ? 'env' : 'none',
+    apiKeyHint: effective === '' ? null : `****${effective.slice(-4)}`,
+    defaultProtocol: toProtocol(row.defaultProtocol),
+    updatedAt: row.updatedAt,
+  }
+}
+
+export function listProviderViews(): ProviderView[] {
+  return listProviders().map(providerView)
+}
+
+// ---------------------------------------------------------------------------
 // 写
 // ---------------------------------------------------------------------------
 
+/**
+ * 新增 / 更新一个厂商。**`apiKey` 不传等于不改**，而不是「清空」。
+ *
+ * ⚠️ 这个区分很要紧：界面上「保存」一个没碰 key 的表单是常态，
+ * 而如果缺省等于清空，那改个标签就把 key 弄丢了 ——
+ * 而 key 丢了的表现是「突然报 key 无效」，用户完全想不到是自己刚才那次保存干的。
+ * 要清空用 `clearApiKey: true`，那是个显式的动作。
+ */
 export function upsertProvider(input: {
   id: string
   label: string
   keyEnvVar: string
   defaultProtocol: ProtocolFamily
+  apiKey?: string
+  clearApiKey?: boolean
 }): void {
   toProtocol(input.defaultProtocol)
+  if (input.clearApiKey && input.apiKey) {
+    throw new Error('clearApiKey 与 apiKey 不能同时给 —— 清空和设置是相反的意图。')
+  }
+  const current = get<{ apiKey: string | null }>('SELECT apiKey FROM providers WHERE id = :id', { id: input.id })
+  const nextApiKey = input.clearApiKey
+    ? null
+    : (input.apiKey?.trim() || current?.apiKey || null)
+
   run(
-    `INSERT INTO providers (id, label, keyEnvVar, defaultProtocol, createdAt, updatedAt)
-     VALUES (:id, :label, :keyEnvVar, :defaultProtocol, :ts, :ts)
+    `INSERT INTO providers (id, label, keyEnvVar, apiKey, defaultProtocol, createdAt, updatedAt)
+     VALUES (:id, :label, :keyEnvVar, :apiKey, :defaultProtocol, :ts, :ts)
      ON CONFLICT(id) DO UPDATE SET
        label           = excluded.label,
        keyEnvVar       = excluded.keyEnvVar,
+       apiKey          = excluded.apiKey,
        defaultProtocol = excluded.defaultProtocol,
        updatedAt       = :ts`,
-    { ...input, ts: now() },
+    // ⚠️ **不能 `{ ...input }`** —— 那样会把 clearApiKey 一起当具名参数传进去，
+    // 而 SQL 里没有它，node:sqlite 会直接抛 `Unknown named parameter`。
+    // 这类「控制字段混进 SQL 参数」的错误只在真的执行到才暴露，所以要显式列。
+    {
+      id: input.id,
+      label: input.label,
+      keyEnvVar: input.keyEnvVar,
+      defaultProtocol: input.defaultProtocol,
+      apiKey: nextApiKey,
+      ts: now(),
+    },
   )
 }
 

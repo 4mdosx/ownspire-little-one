@@ -70,9 +70,12 @@ export type ProtocolFamily =
 /**
  * 一个模型端点的配置。**Adapter 用它决定怎么调模型。**
  *
- * ⚠️ 这里**没有 apiKey 字段** —— key 只在服务端，且由 Adapter 自己从
- * `keyEnvVar` 指向的环境变量取。让协议层见到明文 key 没有好处：
- * 它用不到，却会被日志和错误信息带出去。
+ * ⚠️ **2026-10-09 变化**：`apiKey` 现在存在了。此前这里刻意没有它，
+ * 理由是「协议层用不到，却会被日志和错误信息带出去」。
+ * 那个理由对**协议层仍然成立** —— 所以它只是「路过」，不是被解释：
+ * 协议层任何代码都不读它、不写进错误信息、不打日志。
+ * 之所以要搬进来，是因为 key 的来源变成了两处（库里 / 环境变量），
+ * 而**优先级只能有一个地方判**。分散在 driver 里判等于没有规则。
  */
 export type EndpointConfig = {
   /** 端点 id，如 `zhipu` / `deepseek`。**只是标识，不决定用哪个 Adapter。** */
@@ -87,6 +90,14 @@ export type EndpointConfig = {
    * 比如 `OPENAI_API_KEY`。理由见上面 `apiKey` 的注释。
    */
   keyEnvVar: string
+  /**
+   * **已经解析好的 key**：库里填的值优先，没有则回退到
+   * `process.env[keyEnvVar]`。解析在 db 层做（只有一处判优先级）。
+   *
+   * undefined 表示两处都没有 —— 此时**不要自己编一句「缺少 key」**，
+   * 把 undefined 交给 SDK，它报的错误会指出这个厂商没配。
+   */
+  apiKey?: string
   /**
    * 该协议下的厂商扩展参数。**key 是 OpenAI 的参数名空间**
    * （用 `@ai-sdk/openai` 时它读的就是 `providerOptions.openai`）。

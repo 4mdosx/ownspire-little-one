@@ -36,6 +36,32 @@ export const LEGACY_INDEXES: Record<string, string> = {
     'toolCalls 的唯一约束是过时的（只按 callId）。删掉 data/agent.db 重跑，或先 DROP INDEX idx_toolCalls_callId。',
 }
 
+/**
+ * **可以自动迁移**的列缺失。
+ *
+ * ⚠️ 为什么这跟 `LEGACY_TABLES` 分成两档：
+ *
+ * - 撞上**旧表结构**（少了一列、约束过时）→ 拒绝启动，让人显式迁移。
+ *   因为那意味着要对数据动手术，而「自动搬」很容易搬错。
+ * - 撞上**缺一列**（`ALTER TABLE ADD COLUMN` 能安全补上）→ 直接补。
+ *   ADD COLUMN 是纯加法：不改已有行、不动索引、不会失败。
+ *
+ * 分档的依据只有一条：**这个变更能不能在不解释数据的前提下做完。**
+ * 能 → 自动；不能 → 停下来问。
+ *
+ * ⚠️ 为什么必须显式列在这里：`CREATE TABLE IF NOT EXISTS` 对**已存在的表**
+ * 不做任何事，所以改了 SCHEMA_SQL 之后旧库不会跟着变 —— 而服务照样起来，
+ * 于是所有读 apiKey 的代码都拿到 undefined。这类沉默的不一致最难查。
+ */
+export const MIGRATABLE_COLUMNS: Array<{ table: string; column: string; ddl: string; reason: string }> = [
+  {
+    table: 'providers',
+    column: 'apiKey',
+    ddl: 'ALTER TABLE providers ADD COLUMN apiKey TEXT',
+    reason: 'key 入库（2026-10-09 裁定）。缺这一列时所有读 key 的地方都会拿到 undefined。',
+  },
+]
+
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS sessions (
   id           TEXT PRIMARY KEY,
@@ -115,9 +141,14 @@ CREATE INDEX IF NOT EXISTS idx_toolCalls_session ON toolCalls(sessionId, id);
 
 -- 一个厂商。**key 属于厂商，不属于端点，也不属于协议。**
 --
--- ⚠️ **没有 key 列。** 只存 keyEnvVar（环境变量名），key 本身永远不进库。
--- 理由：key 入库意味着它会出现在备份里，而备份是要被复制/上传的。
--- 环境变量名是「去哪里取」而不是「是什么」，泄露了不直接等于泄露凭据。
+-- ⚠️ **apiKey 是明文存的**（2026-10-09 裁定，与早先「key 永不进库」的纪律相反）。
+--    理由是管理界面要能直接填 key，而那要求它有个落盘的地方。
+--    代价明说：**key 会出现在数据库备份里**。换来的补偿是所有出站接口
+--    永不回显它 —— 那才是泄漏面，而不是存储本身。
+--
+-- ⚠️ keyEnvVar 从「key 的唯一来源」降级为**兜底**：取值优先级是
+--    apiKey 优先，没有才看环境变量。所以容器里用 env 注入的既有方式
+--    仍然有效，界面填的只是覆盖它。
 --
 -- ⚠️ **注释里绝对不能出现反引号** —— 这整个文件是一个模板字符串，
 -- 一个反引号就会提前结束它，而症状是「TS 报某个远行的语法错」，
@@ -125,8 +156,10 @@ CREATE INDEX IF NOT EXISTS idx_toolCalls_session ON toolCalls(sessionId, id);
 CREATE TABLE IF NOT EXISTS providers (
   id              TEXT PRIMARY KEY,
   label           TEXT NOT NULL,
-  -- key 所在的环境变量名，**不是 key 本身**。
+  -- key 所在的环境变量名。**有apiKey 时它只是兜底**，不是唯一来源。
   keyEnvVar        TEXT NOT NULL,
+  -- 界面填入的 key。明文，**永不出现在任何响应里**。
+  apiKey           TEXT,
   -- 这个厂商端点的**默认**协议。单端点可在 endpoints.protocol 里覆盖。
   defaultProtocol TEXT NOT NULL,
   createdAt       INTEGER NOT NULL,
