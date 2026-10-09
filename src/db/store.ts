@@ -10,6 +10,7 @@ import {
   touchSession,
 } from './sessions.js'
 import {
+  defaultModelId,
   findEndpoint as lookupEndpoint,
   findModel as lookupModel,
   firstModel,
@@ -62,8 +63,23 @@ export const store: TurnStore = {
   },
 
   resolveModel(modelId, endpointId) {
-    // ⚠️ 没指定模型时取第一个可用的 —— 与 `defaultModelId()` 的区别是
-    // 它**不读环境变量**（AGENT_MODEL 配错了该在启动时报，不是每轮报）。
-    return modelId ? lookupModel(modelId, endpointId) : firstModel(endpointId)
+    // ⚠️ 没指定模型时用 `defaultModelId()`，**不是** `firstModel()`。
+    //
+    // 这不是风格问题，是联调时真踩到的：契约的「发消息」请求体里**没有 modelId**
+    // （v1 就是这样），所以每轮必然落到「没指定」这条分支。而 `firstModel()`
+    // 是按 `(endpointId, label)` 排序取第一个 —— 那个顺序里排第一的是
+    // `deepseek-chat`。于是配了 `AGENT_MODEL=glm-5.3`、库里的端点也指向智谱，
+    // 请求却打到了 `api.deepseek.com`。
+    //
+    // 更糟的是它**看起来是生效的**：`/api/models` 报的 default 来自
+    // `defaultModelId()`（是 glm-5.3），启动日志也打印 glm-5.3 ——
+    // 只有真正跑起来的时候用一个别的模型。**两份真相，且不一致的那份只在运行时露出来。**
+    //
+    // 「每轮读环境变量会掩盖配置错误」这个顾虑不成立：`AGENT_MODEL` 配错时
+    // `defaultModelId()` 会直接抛，而启动路径（server.ts）已经先调过它一次，
+    // 错误在启动时就报出来了 —— 不需要靠每轮再读一次来发现问题。
+    if (modelId) return lookupModel(modelId, endpointId)
+    if (endpointId) return firstModel(endpointId)
+    return lookupModel(defaultModelId()) ?? firstModel()
   },
 }
