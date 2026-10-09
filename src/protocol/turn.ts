@@ -253,11 +253,19 @@ export async function executeTurn(deps: TurnDeps, input: ExecuteTurnInput): Prom
       data: { runId: run.id, status: result.status, steps: result.steps, usage: result.usage },
     })
   } catch (error) {
-    const { code, error: message } = describe(error)
-    deps.store.finishRun(run.id, { status: 'failed', code, error: message })
+    const described = describe(error)
+    deps.store.finishRun(run.id, { status: 'failed', code: described.code, error: described.message })
     // ⚠️ **不自己发 `run.failed`** —— `createAgentStream` 的 catch 会发。
     // 发两次会让前端终止指示器触发两次，而 raven 那边是「收到终止事件就关指示器」。
-    throw Object.assign(new Error(message), { code })
+    //
+    // ⚠️ **hint 与 retryable 必须一起带过去**：这里是唯一一次重新包装，
+    //只捞code 与 message 就等于把「该充值还是该等待」这个判断扔掉了 ——
+    // 而它恰好是 raven 显示什么、以及要不要给重试按钮的依据。
+    throw Object.assign(new Error(described.message), {
+      code: described.code,
+      ...(described.hint !== undefined ? { hint: described.hint } : {}),
+      ...(described.retryable !== undefined ? { retryable: described.retryable } : {}),
+    })
   } finally {
     deps.store.touchSession(sessionId)
   }
@@ -376,19 +384,37 @@ function safeParse(text: unknown): unknown {
   }
 }
 
-function describe(error: unknown): { code: string; error: string } {
+/**
+ * 把异常转成 `{ code, message, hint?, retryable? }`。
+ *
+ * ⚠️ **hint 与 retryable 要在这里读出来**，因为上面 catch 里会重新包装错误，
+ * 只捞 code 与 message 就等于把「该充值还是该等待」这个判断扔在中间那一层。
+ */
+function describe(error: unknown): {
+  code: string
+  message: string
+  hint?: string
+  retryable?: boolean
+} {
   if (typeof error === 'object' && error !== null) {
-    const candidate = error as { code?: unknown; message?: unknown }
+    const candidate = error as {
+      code?: unknown
+      message?: unknown
+      hint?: unknown
+      retryable?: unknown
+    }
     if (typeof candidate.code === 'string' && candidate.code !== '') {
       return {
         code: candidate.code,
-        error: typeof candidate.message === 'string' ? candidate.message : '未知错误。',
+        message: typeof candidate.message === 'string' ? candidate.message : '未知错误。',
+        ...(typeof candidate.hint === 'string' ? { hint: candidate.hint } : {}),
+        ...(typeof candidate.retryable === 'boolean' ? { retryable: candidate.retryable } : {}),
       }
     }
   }
   return {
     code: 'internal_error',
-    error: error instanceof Error ? error.message : String(error),
+    message: error instanceof Error ? error.message : String(error),
   }
 }
 
