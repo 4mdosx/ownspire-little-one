@@ -1,0 +1,34 @@
+{
+  "name": "ownspire-little-one",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.15.0"
+  },
+  "scripts": {
+    "dev": "node --import tsx --watch src/main.ts",
+    "start": "node --import tsx src/main.ts",
+    "typecheck": "tsc --noEmit --incremental false",
+    "verify": "npm run verify:purity && npm run verify:protocol && npm run verify:tool-protocol && npm run verify:driver && npm run verify:registry",
+    "verify:purity": "node --import tsx scripts/verify-protocol-purity.ts",
+    "verify:protocol": "node --import tsx scripts/protocol/verify-turn.ts",
+    "verify:driver": "node --import tsx scripts/drivers/verify-vercel-ai.ts",
+    "verify:registry": "node --import tsx scripts/registry/verify-registry.ts",
+    "verify:gateway": "node --import tsx scripts/verify-gateway.ts",
+    "verify:stream": "node --import tsx scripts/verify-stream.ts",
+    "verify:tool-protocol": "node --import tsx scripts/protocol/verify-tool-protocol.ts"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "^3.0.0",
+    "ai": "7.0.60",
+    "dotenv": "^16.4.5",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.6",
+    "tsx": "^4.19.2",
+    "typescript": "^5"
+  },
+  "description": "The Little One Inside the Flask — 业务无关的 Agent Runtime"
+}

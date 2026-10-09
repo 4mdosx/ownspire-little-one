@@ -1,0 +1,14 @@
+node_modules
+data
+.env
+.env.local
+*.db
+*.db-wal
+*.db-shm
+.git
+.DS_Store
+scripts
+docs
+#验证脚本不进镜像：它们要raven 在跑，且带 VERIFY_TOOL 之类的环境分支。
+verify-*.ts
+fake-provider.ts
