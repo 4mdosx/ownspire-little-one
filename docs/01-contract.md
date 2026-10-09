@@ -220,9 +220,18 @@ GET /api/models         → { models: [{ id, label, provider }] }
 
 ### `run.failed` 的 `code`
 
+`run.failed` 的 data 有四个字段：`{ runId, code, error, hint?, retryable? }`
+（后两个是 2026-10-09 加的，见下）。
+
 | code | 含义 | raven 该怎么做 |
 |---|---|---|
-| `model_error` | 模型调用失败（配额、网络、内容过滤） | 显示 error原文，不重试 |
+| `model_auth_failed` | key 无效或缺失 | **提示去配置 key**，不要重试 |
+| `model_quota_exhausted` | 余额不足 / 欠费 / 资源包用尽 | **提示去充值**，不要重试 |
+| `model_rate_limited` | 被厂商限流 | 等几十秒重试，**这是唯一该自动重试的** |
+| `model_content_filtered` | 被内容过滤拦下 | 显示原文，让用户改说法 |
+| `model_not_found` | 模型 id 或端点不存在 | 提示去改模型配置 |
+| `model_upstream_error` | 厂商侧 5xx | 稍后重试 |
+| `model_error` | 模型调用失败但认不出具体成因 | 显示 error 原文 |
 | `tool_error` | 工具抛异常 | 显示 tool 名与 error |
 | `invalid_tool_input` | 模型给的参数不合法 | 显示出来，这是可以改Prompt 重试的 |
 | `model_not_configured` | 服务端没配模型 id | **这是运维问题不是用户问题**，提示联系维护者，不要让用户重试 |
@@ -230,6 +239,28 @@ GET /api/models         → { models: [{ id, label, provider }] }
 | `internal_error` | Runtime 自己崩了 | 提示重试 |
 
 **`code` 是稳定标识，`error` 是不稳定文案。** raven 按 code 分支，不要匹配文案。
+
+#### 为什么把「模型调用失败」拆成六个（2026-10-09）
+
+以前只有 `model_error` 一个码，而它盖住的三件事**要采取的行动完全相反**：
+
+| 厂商返回 | 真实处置 |
+|---|---|
+| 401 key 无效 | 去配置 key —— 重试一万次还是那把废 key |
+| 429「余额不足或无可用资源包」 | 去充值 —— 等再久也没用 |
+| 429「rate limit exceeded」 | **等 30 秒就好** —— 重试是有效的 |
+
+一个码意味着 raven 只能把厂商原文显示出来，而「余额不足或无可用资源包,请充值。」
+这句话里没有「现在该做什么」。同理，说成「Runtime 崩了，请重试」会让用户去重启服务，
+而重启对这个错误毫无作用。
+
+#### `hint` 与 `retryable`（加字段，不升版本）
+
+- **`hint`**：一句话可执行提示。raven **优先显示它**，而不是 `error`
+  （`error` 是厂商原文，含 request_id 等排查信息，适合折叠在详情里）。
+- **`retryable`**：**别靠文案猜能不能重试**。前端若猜错，代价是一个
+  永远转圈的进度条 —— 而「限流可以重试、欠费不能」只有服务端知道。
+- 两者都是**可选**字段：旧版 little-one 不发它们时，raven 走原有逻辑即可。
 
 ⚠️ **`model_not_configured` 正常情况下不会出现** —— `startServer()` 在启动时就检查了
 模型配置，缺 key 或缺模型 id 会直接拒绝启动（容器起不来，compose 会报）。

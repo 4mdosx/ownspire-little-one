@@ -383,24 +383,77 @@ async function testMessageTranslation(): Promise<void> {
 
 function testErrorClassification(): void {
   console.log('\n[翻译 · 错误归类]')
-  check(
-    '缺 key → model_error（**不是 internal_error**，否则用户以为 Runtime 崩了）',
-    normalizeError(Object.assign(new Error('OpenAI API key is missing'), { name: 'LoadAPIKeyError' }))
-      .code === 'model_error',
+  // ⚠️ 这些断言守护的是一件具体的事：**code 必须能让人采取不同的行动**。
+  // 以前全都压成 model_error，于是「充值」「等 30 秒」「去配 key」三件事
+  // 在前端长得一模一样，用户只能去读厂商原文。
+  const auth = normalizeError(
+    Object.assign(new Error('OpenAI API key is missing'), { name: 'LoadAPIKeyError' })
   )
+  check(
+    '缺 key → model_auth_failed（不是 internal_error，否则用户以为 Runtime 崩了）',
+    auth.code === 'model_auth_failed',
+    auth
+  )
+  check('缺 key 不可重试', auth.retryable === false, auth)
   check(
     '入参不合法 → invalid_tool_input',
     normalizeError(Object.assign(new Error('bad input'), { name: 'AI_InvalidToolInputError' })).code ===
       'invalid_tool_input',
   )
   check(
-    '已有 code 的原样透传',
+    '已有 code 的原样透传（别人分好类的错误不该被改写）',
     normalizeError(Object.assign(new Error('x'), { code: 'custom_code' })).code === 'custom_code',
   )
   check('别的归 internal_error', normalizeError(new Error('something odd')).code === 'internal_error')
+
+  const limited = normalizeError(Object.assign(new Error('rate limited'), { statusCode: 429 }))
+  check('429 → model_rate_limited', limited.code === 'model_rate_limited', limited)
+  check('⚠️ 限流是可重试的 —— 这是它与欠费最大的区别', limited.retryable === true, limited)
+
+  // ↓ 2026-10-09 联调时真踩到的：智谱把余额不足报成 429 + code 1113，
+  //   而它与限流的行动完全相反（充值 vs 等待）。判错的代价是让人干等。
+  const broke = normalizeError(
+    Object.assign(
+      Object.assign(new Error('Failed after 3 attempts. Last error: AI_APICallError: 余额不足或无可用资源包,请充值。'), {
+        cause: Object.assign(new Error('余额不足或无可用资源包,请充值。'), {
+          statusCode: 429,
+          data: { error: { code: '1113' } },
+        }),
+      }),
+      { name: 'AI_APICallError' }
+    )
+  )
+  check('智谱余额不足（429 + code 1113）→ model_quota_exhausted', broke.code === 'model_quota_exhausted', broke)
+  check('余额不足不可重试（重试一万次也没用）', broke.retryable === false, broke)
   check(
-    '429 → model_error（配额问题不该显示成崩了）',
-    normalizeError(Object.assign(new Error('rate limited'), { statusCode: 429 })).code === 'model_error',
+    'cause 链里的厂商码被挖到了（只看顶层会退化成 model_error）',
+    broke.code !== 'model_error'
+  )
+  check(
+    '提示语说清该做什么，而不是复述厂商原文',
+    /充值/.test(broke.hint) && broke.hint !== broke.message,
+    broke
+  )
+  check(
+    '厂商原文（含排查信息）仍在 Error.message 里',
+    broke.message.includes('余额不足'),
+    broke
+  )
+
+  const auth401 = normalizeError(
+    Object.assign(new Error('Authentication Fails, Your api key: ****4a7k is invalid'), { statusCode: 401 })
+  )
+  check('401 → model_auth_failed', auth401.code === 'model_auth_failed', auth401)
+
+  check(
+    '5xx → model_upstream_error 且可重试',
+    normalizeError(Object.assign(new Error('bad gateway'), { statusCode: 502 })).code ===
+      'model_upstream_error'
+  )
+  check(
+    '404 / 模型不存在 → model_not_found',
+    normalizeError(Object.assign(new Error('The model does not exist'), { statusCode: 404 })).code ===
+      'model_not_found'
   )
 }
 

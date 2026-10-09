@@ -8,6 +8,11 @@ import {
   type ToolSet,
 } from 'ai'
 import type { AgentDriver, ChatMessage, DriverHooks, DriverRequest, DriverResult } from '../../protocol/driver.js'
+import {
+  classifyModelError,
+  type ModelError,
+  type ModelErrorFacts,
+} from '../../protocol/model-error.js'
 import type { Emit } from '../../lib/sse.js'
 import type { Risk } from '../../tools/registry.js'
 
@@ -425,33 +430,98 @@ function describe(error: unknown): string {
 
 /**
  * 把 SDK / provider 的错误归到契约 §四 的 code 上。
- * **前端按 code 分支，不匹配文案**（契约 §四），所以这张表是契约的一部分。
+ *
+ * ⚠️ **这里只负责「挖事实 + 分类」，说人话的部分在 `protocol/model-error.ts`。**
+ * driver 层的职责是知道 SDK 的错误长什么样（这是它唯一的专属知识），
+ * 而「余额不足要充值、限流要等待」这类判断是协议层的职责，与 SDK 无关。
+ *
+ * ⚠️ **必须沿 `cause` 链往下挖。** SDK 重试 3 次之后抛出的那个错误，
+ * `statusCode` 与厂商码往往**不在顶层**（顶层只有一句
+ * `Failed after 3 attempts. Last error: ...`）。曾经就是因为只读顶层，
+ * 智谱的「余额不足」被判成 `internal_error` —— 而它其实是 429 + code 1113。
  */
-export function normalizeError(error: unknown): Error & { code: string } {
-  const message = describe(error)
+export function normalizeError(error: unknown): Error & { code: string; hint: string; retryable: boolean } {
+  // ⚠️ SDK 自己的工具输入错误**不属于「模型错误」这一类**，它的 code 有自己的含义
+  // （契约 §四：这个 code 提示可以改 prompt 重试）。所以在进分类器之前先摘出去。
   const name = error instanceof Error ? error.name : ''
-  const raw = error as { code?: unknown; statusCode?: unknown } | null
-
-  if (raw && typeof raw.code === 'string' && raw.code !== '') {
-    return Object.assign(new Error(message), { code: raw.code })
-  }
-
   if (name === 'AI_InvalidToolInputError' || name === 'AI_ToolCallRepairError') {
-    return Object.assign(new Error(message), { code: 'invalid_tool_input' })
+    return Object.assign(new Error(describe(error)), {
+      code: 'invalid_tool_input',
+      hint: '模型给的工具参数不合法。把它显示出来，改 prompt 后可以重试。',
+      retryable: false,
+    })
   }
 
-  const status = typeof raw?.statusCode === 'number' ? raw.statusCode : undefined
-  if (
-    name === 'LoadAPIKeyError' ||
-    name === 'NoSuchModelError' ||
-    name === 'APICallError' ||
-    status === 401 ||
-    status === 403 ||
-    status === 429 ||
-    /api key|API key|apiKey|rate limit|quota|model/i.test(message)
-  ) {
-    return Object.assign(new Error(message), { code: 'model_error' })
+  const facts = extractFacts(error)
+  const classified: ModelError = classifyModelError(facts)
+  return Object.assign(new Error(classified.error), {
+    code: classified.code,
+    hint: classified.hint,
+    retryable: classified.retryable,
+  })
+}
+
+/**
+ * 沿 cause 链收集事实。**越深的越具体**，所以一旦拿到就停——
+ * 外层那句「Failed after 3 attempts」不含任何可判定信息。
+ */
+function extractFacts(error: unknown): ModelErrorFacts {
+  const chain: unknown[] = []
+  for (let current = error, depth = 0; current !== undefined && current !== null && depth < 8; depth += 1) {
+    chain.push(current)
+    current = (current as { cause?: unknown }).cause
   }
 
-  return Object.assign(new Error(message), { code: 'internal_error' })
+  let statusCode = 0
+  let vendorCode = ''
+  let existingCode = ''
+  let message = error instanceof Error ? error.message : String(error)
+
+  for (const link of chain) {
+    if (typeof link !== 'object' || link === null) continue
+    const candidate = link as {
+      statusCode?: unknown
+      status?: unknown
+      code?: unknown
+      message?: unknown
+      error?: unknown
+      data?: { error?: unknown } | unknown
+      responseBody?: unknown
+    }
+
+    // 错误自带的 code —— 那是**别人已经做好的分类**，规范化层要认它。
+    // 判据是「不在 SDK 自有的那几个里」：`invalid_request_error` / `api_error`
+    // 是 SDK 对所有厂商统一的壳码，透传它们等于什么都没说。
+    if (typeof candidate.code === 'string' && candidate.code !== '' && !SHELL_CODES.has(candidate.code)) {
+      existingCode ||= candidate.code
+    }
+
+    // 厂商码：SDK 常把厂商的码塞在 data.error.code。
+    // ⚠️ 不把任意 code 字符串都当厂商码 —— 基于噪音做判断比不判断更糟。
+    const nested = (candidate.data as { error?: { code?: unknown } } | undefined)?.error?.code
+    if (typeof nested === 'string' && nested !== '') vendorCode ||= nested
+
+    if (!statusCode) {
+      if (typeof candidate.statusCode === 'number') statusCode = candidate.statusCode
+      else if (typeof candidate.status === 'number') statusCode = candidate.status
+    }
+    // 内层的 message 更有信息量：外层是包装文案（「Failed after 3 attempts...」）。
+    if (typeof candidate.message === 'string' && candidate.message !== '') {
+      message = depthIsInner(chain, link) ? candidate.message : message
+    }
+  }
+
+  return {
+    statusCode,
+    ...(vendorCode !== '' ? { vendorCode } : {}),
+    ...(existingCode !== '' ? { existingCode } : {}),
+    message,
+  }
+}
+
+/** SDK 对所有厂商统一的壳码。**透传它们等于什么都没说**，所以要排除。 */
+const SHELL_CODES = new Set(['invalid_request_error', 'api_error', 'error'])
+
+function depthIsInner(chain: unknown[], link: unknown): boolean {
+  return chain.indexOf(link) > 0
 }

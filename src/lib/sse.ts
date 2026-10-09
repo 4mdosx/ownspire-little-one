@@ -49,7 +49,26 @@ export type RunCompleted = {
   usage: unknown
 }
 
-export type RunFailed = { runId: string; code: string; error: string }
+export type RunFailed = {
+  runId: string
+  code: string
+  error: string
+  /**
+   * 给用户的可执行提示，一句话说明「现在该做什么」。
+   *
+   * ⚠️ **加字段不改契约版本**（§八「加字段永远可以」）。raven 按 `code` 分支，
+   * `hint` 只是让同一个 code 下的文案不必由前端各写一遍。
+   */
+  hint?: string
+  /**
+   * 同样的请求再发一次有没有意义。
+   *
+   * 单拎出来的原因：前端若靠文案猜「能不能重试」，猜错的代价是
+   * 一个永远转圈的进度条 —— 而「限流可以重试、欠费不能」这件事
+   * 只有服务端知道。
+   */
+  retryable?: boolean
+}
 
 /**契约 §四 的事件表。加事件可以，改名不行。 */
 export type AgentEvent =
@@ -136,8 +155,17 @@ export function createAgentStream(
         try {
           await work(emit)
         } catch (error) {
-          const { code, error: message } = describeError(error)
-          emit({ name: 'run.failed', data: { runId: options.runId, code, error: message } })
+          const { code, error: message, hint, retryable } = describeError(error)
+          emit({
+            name: 'run.failed',
+            data: {
+              runId: options.runId,
+              code,
+              error: message,
+              ...(hint !== undefined ? { hint } : {}),
+              ...(retryable !== undefined ? { retryable } : {}),
+            },
+          })
         } finally {
           close()
         }
@@ -161,13 +189,29 @@ export function createAgentStream(
   })
 }
 
-function describeError(error: unknown): { code: string; error: string } {
+/**
+ * 把异常转成 `run.failed` 的三个字段。
+ *
+ * ⚠️ `hint` 与 `retryable` 是**加字段**（契约 §八：加字段永远可以，改名要升版本）。
+ * 加它们是因为 raven 只能拿到 `code` + `error` 时，两个真正要采取的行动不同的
+ * 错误（余额不足 / 被限流）在前端长得一样 —— 用户只能去读厂商原文，
+ * 而「余额不足或无可用资源包,请充值。」这句话里没有「现在该做什么」。
+ */
+function describeError(error: unknown): { code: string; error: string; hint?: string; retryable?: boolean } {
   if (typeof error === 'object' && error !== null) {
-    const candidate = error as { code?: unknown; message?: unknown; name?: unknown }
+    const candidate = error as {
+      code?: unknown
+      message?: unknown
+      name?: unknown
+      hint?: unknown
+      retryable?: unknown
+    }
     if (typeof candidate.code === 'string' && candidate.code !== '') {
       return {
         code: candidate.code,
         error: typeof candidate.message === 'string' ? candidate.message : '未知错误。',
+        ...(typeof candidate.hint === 'string' ? { hint: candidate.hint } : {}),
+        ...(typeof candidate.retryable === 'boolean' ? { retryable: candidate.retryable } : {}),
       }
     }
   }
