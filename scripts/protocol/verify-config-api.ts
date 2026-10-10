@@ -85,7 +85,9 @@ async function main(): Promise<void> {
   process.env.AGENT_DB_FILE = path.join(dir, 'agent.db')
   const token = 'verify-token-long-enough-0123456789'
   process.env.AGENT_RUNTIME_TOKEN = token
-  delete process.env.ZHIPU_API_KEY
+  // ⚠️ 这里曾有一行 `delete process.env.ZHIPU_API_KEY` —— 用来保证「库里没存」
+  // 就是「没配置」。现在厂商状态只由库决定（2026-10-09 删了 env 线路），
+  // 进程环境里有没有那把 key 都不影响任何断言，所以那行没用了。
 
   const { ensureSchema } = await import('../../src/db/database.js')
   const { seedBuiltinProviders } = await import('../../src/db/registry-store.js')
@@ -123,17 +125,24 @@ async function main(): Promise<void> {
       !initial.body.includes('"apiKey"'),
       initial.body.slice(0, 200)
     )
-    // ⚠️ **不能断言「apiKeySet === false」** —— 看着合理，但 `config/env.ts` 在
-    // import 时会 loadEnv 把 .env 读进来，而 .env 里真的有 ZHIPU_API_KEY，
-    // 所以库里没存不代表「没配置」。断言要落在**形状**上，不是具体状态值。
-    const anyProvider = (initial.json['providers'] as Array<Record<string, unknown>>)[0]
-    check(
-      '厂商只给 key 状态（布尔 + 掩码），不给 key 本身',
-      typeof anyProvider?.['apiKeySet'] === 'boolean' &&
-        (anyProvider?.['apiKeyHint'] === null || typeof anyProvider?.['apiKeyHint'] === 'string') &&
-        ['db', 'env', 'none'].includes(String(anyProvider?.['apiKeySource'])),
-      anyProvider
-    )
+// ⚠️ 这里曾有一条注释说「不能断言 apiKeySet === false，因为 config/env.ts
+  // 会在 import 时 loadEnv 把 .env 读进来」。**那条 caveat 已随env 线路一起作废**
+  // （2026-10-09）—— 现在厂商状态只由库决定，与进程环境无关。
+  // 但断言仍然落在**形状**上：具体状态会随 seed 与前面用例变化，
+  // 而形状是契约。分清「值会变」与「形状会变」是两种不同的谨慎。
+  const anyProvider = (initial.json['providers'] as Array<Record<string, unknown>>)[0]
+  check(
+    '厂商只给 key 状态（布尔 + 掩码），不给 key 本身',
+    typeof anyProvider?.['apiKeySet'] === 'boolean' &&
+      (anyProvider?.['apiKeyHint'] === null || typeof anyProvider?.['apiKeyHint'] === 'string') &&
+      ['db', 'none'].includes(String(anyProvider?.['apiKeySource'])),
+    anyProvider
+  )
+  check(
+    '厂商视图不含 keyEnvVar（环境变量已不是来源）',
+    !initial.body.includes('keyEnvVar'),
+    initial.body.slice(0, 200)
+  )
     check('端点行带 providerId 与模型数（界面分组要用）', typeof (initial.json['endpoints'] as Array<Record<string, unknown>>)[0]?.['providerId'] === 'string')
 
     console.log('\n[写 · 填 key]')

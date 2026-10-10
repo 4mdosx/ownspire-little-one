@@ -15,7 +15,7 @@ ownspire 的 **Agent Runtime**：负责**模型下一步做什么**。
 | 端口 | 容器 **5900**（atlas 5600 · navi 5500 · raven 5800 之后的下一个） |
 | 契约 | **[docs/01-contract.md](docs/01-contract.md)** v1 冻结，改它需要升版本号 |
 | 框架层 | `ai@7.0.60` —— Agent Loop，**不随模型换** |
-| 模型层 | `@ai-sdk/openai` —— 换厂商只改环境变量，不改代码 |
+| 模型层 | `@ai-sdk/openai` —— 换厂商只改数据库配置，不改代码 |
 | 执行 | raven —— 工具在哪执行、有什么权限、怎么隔离，都由它决定 |
 
 ## 与 raven 怎么分
@@ -53,32 +53,29 @@ interface RavenClient {
 
 ## 模型怎么配
 
-**两层是分开的**：框架是 Vercel 的 `ai`，模型走 `@ai-sdk/openai` 这个插件。
-而这个插件**同时覆盖 OpenAI 与所有 OpenAI 兼容端点**，所以换厂商不动代码：
+**全部在数据库里，用 raven 的「模型与厂商」界面填。环境变量不参与**（2026-10-09 裁定）。
 
-```bash
-# 当前用的
-AGENT_OPENAI_BASE_URL=https://api.deepseek.com/v1
-AGENT_MODEL=deepseek-chat
-OPENAI_API_KEY=<DeepSeek 的 key>
+三张表：`providers`（厂商 + key + 默认协议）→ `endpoints`（走哪种协议 + baseUrl）
+→ `models`（模型 id + 推理档位）。启动时幂等 seed 内置的三家厂商与端点，
+但 **key 不 seed** —— 所以刚起来一定是「未配置 key」，那是真的没配。
 
-# 换 Kimi —— 只改这行
-AGENT_OPENAI_BASE_URL=https://api.moonshot.cn/v1
-```
+| 想改什么 | 去哪改 |
+|---|---|
+| API key | 界面 · 厂商段 · API key 输入框 |
+| 端点地址、协议 | 界面 · 端点段 |
+| 有哪些模型可选 | 界面 · 模型段 |
+| 默认用哪个 | `models` 表的第一项（没有单独开关） |
 
-| 变量 | 作用 | 换厂商时 |
-|---|---|---|
-| `AGENT_OPENAI_BASE_URL` | 端点。留空 = OpenAI 官方 | **必改** |
-| `OPENAI_API_KEY` | key。变量名保持不变是刻意的——插件在读它，改名就得改代码 | **必改** |
-| `AGENT_MODEL` | 模型 id | **必改**（留着 `gpt-5` 去请求别家会拿到「模型不存在」）|
-| `AGENT_MODELS` | 前端显示的清单，`id` 或 `id=显示名`，逗号分隔 | 可选 |
+⚠️ **曾经有过 env 线路**（`OPENAI_API_KEY` / `AGENT_MODEL` / `AGENT_REASONING_EFFORT`），
+现在全删了，`providers.keyEnvVar` 那一列也没了。旧数据库启动时会**自动 `DROP COLUMN` 迁移**
+（在真有数据的库上验过：不丢数据，端点与会话都在）；只有该列被索引或外键引用而删不掉时
+才拒绝启动并报出原因。
 
-优先级：**`AGENT_MODEL` > `AGENT_MODELS` 首项** > 都没配（启动时报错）。
+删掉的理由不是「更干净」，是**两份真相会让用户改错地方却看到「已保存」**：
+界面上填的 key 被容器注入的 env 盖掉，而提示语说的是「配置完成」。
+一份真相可以有很多呈现方式，两份真相只会让人猜哪份生效。
 
-⚠️ **两个都不配时服务拒绝启动**，而不是兜一个默认模型。理由：兜一个「一定不存在」
-的名字只会得到一个语义错误的 `model_error`，而报错文案指向 key，排查方向会被带偏。
-
-模型清单**不在代码里硬编码** —— 列一份与实际端点不符的清单比不列更糟：
+模型清单不在代码里硬编码 —— 列一份与实际端点不符的清单比不列更糟：
 用户会选了才发现用不了。
 
 ---
@@ -122,7 +119,7 @@ curl -s localhost:5900/healthz | jq
 src/
 ├── main.ts          进程入口（含 unhandledRejection 兜底）
 ├── server.ts        路由 —— 每个 handler 对应契约的一节
-├── config/env.ts    环境变量。只加载与算路径，不建连接
+├── config/env.ts    部署参数（库路径/ token / 端口）。**模型配置不在这里**
 ├── agent/loop.ts    Agent Loop：SDK 的流 → 契约的八个事件
 ├── tools/
 │   ├── registry.ts  工具定义、风险、JSON Schema 导出

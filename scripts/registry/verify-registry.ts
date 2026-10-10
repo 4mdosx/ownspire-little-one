@@ -76,7 +76,6 @@ function main(): void {
   upsertProvider({
     id: 'zhipu',
     label: '智谱 GLM',
-    keyEnvVar: 'ZHIPU_API_KEY',
     defaultProtocol: 'openai-chat-completions',
   })
   check('厂商建出来后能列出', listProviders().some((p) => p.id === 'zhipu'))
@@ -87,13 +86,17 @@ function main(): void {
   upsertProvider({
     id: 'zhipu',
     label: '智谱 GLM',
-    keyEnvVar: 'ZHIPU_API_KEY',
     defaultProtocol: 'openai-chat-completions',
     apiKey: 'sk-test-abcdefgh1234',
   })
   const view = listProviderViews().find((p) => p.id === 'zhipu')
   check('库里确实存了 key（裁定如此）', listProviders().find((p) => p.id === 'zhipu')?.apiKey !== null)
   check('出站视图不含apiKey 字段', view !== undefined && !('apiKey' in view), Object.keys(view ?? {}))
+  check(
+    '出站视图不含 keyEnvVar（环境变量已不是来源）',
+    view !== undefined && !('keyEnvVar' in view),
+    Object.keys(view ?? {})
+  )
   check(
     '出站视图只给末四位掩码',
     view?.apiKeyHint === '****1234',
@@ -114,7 +117,6 @@ function main(): void {
   upsertProvider({
     id: 'zhipu',
     label: '智谱 GLM（改名）',
-    keyEnvVar: 'ZHIPU_API_KEY',
     defaultProtocol: 'openai-chat-completions',
   })
   check(
@@ -124,7 +126,6 @@ function main(): void {
   upsertProvider({
     id: 'zhipu',
     label: '智谱 GLM（改名）',
-    keyEnvVar: 'ZHIPU_API_KEY',
     defaultProtocol: 'openai-chat-completions',
     clearApiKey: true,
   })
@@ -136,7 +137,6 @@ function main(): void {
     upsertProvider({
       id: 'zhipu',
       label: 'x',
-      keyEnvVar: 'X',
       defaultProtocol: 'openai-chat-completions',
       apiKey: 'a',
       clearApiKey: true,
@@ -149,7 +149,6 @@ function main(): void {
   upsertProvider({
     id: 'zhipu',
     label: '智谱 GLM',
-    keyEnvVar: 'ZHIPU_API_KEY',
     defaultProtocol: 'openai-chat-completions',
     clearApiKey: true,
   })
@@ -180,7 +179,7 @@ function main(): void {
     chat?.protocol !== anthropic?.protocol,
     [chat?.protocol, anthropic?.protocol],
   )
-  check('keyEnvVar 从厂商继承，端点自己不持有', anthropic?.keyEnvVar === 'ZHIPU_API_KEY', anthropic)
+  check('key 从厂商继承，端点自己不持有凭据', anthropic?.apiKey === undefined, anthropic)
   check(
     'extraBody 存读往返（GLM 的 thinking）',
     JSON.stringify(chat?.extraBody) === JSON.stringify({ thinking: { type: 'enabled' } }),
@@ -230,14 +229,46 @@ function main(): void {
   )
 
   console.log('\n[缺 key 的报告]')
-  delete process.env.ZHIPU_API_KEY
+  // ⚠️ 这里不再 `delete process.env.XXX` —— 环境变量已不是key 的来源，
+  // 那样做只会让断言变成「恰好通过」：它测的是一个已经不存在的分支。
+  // 真正要守的是「报的是**厂商**，不是变量名」——
+  // 「环境变量名」这个概念已经删掉了，报出来就说明还有残留的 env 依赖。
   const missing = missingKeys()
   check(
     '**只报有启用端点的厂商** —— 建了厂商但没建端点的不该让启动失败',
-    missing.some((m) => m.provider === 'zhipu' && m.envVar === 'ZHIPU_API_KEY'),
+    missing.some((m) => m.provider === 'zhipu'),
     missing,
   )
-  check('报告里给的是环境变量名，不是 key', missing.every((m) => !m.envVar.includes('sk-')), missing)
+  check(
+    '报告里给的是厂商 id 与显示名，不含环境变量名',
+    missing.every((m) => !('envVar' in m) && !m.provider.includes('_API_KEY')),
+    missing,
+  )
+  upsertProvider({
+    id: 'zhipu',
+    label: '智谱 GLM',
+    defaultProtocol: 'openai-chat-completions',
+    apiKey: 'sk-test-abcdefgh1234',
+  })
+  check('库里填了 key 之后不再报缺', !missingKeys().some((m) => m.provider === 'zhipu'), missingKeys())
+  upsertProvider({
+    id: 'zhipu',
+    label: '智谱 GLM',
+    defaultProtocol: 'openai-chat-completions',
+    clearApiKey: true,
+  })
+
+  // ⚠️ **本次改动的核心不变量**：环境变量里有一把 key、而库里没填时，
+  // **那把 key 不能被采纳**。
+  //
+  // 为什么这条值得单独断言：它是「env 线路彻底删干净」与「只是把优先级换了」
+  // 之间唯一的区别。前者满足它，后者不满足 —— 而后者在功能测试里看起来完全正常
+  //（因为库里通常已经填了 key，env 兜底永远不显形）。
+  // 只有专门把库里清空、env 摆上，才能把这条路径逼出来。
+  process.env.ZHIPU_API_KEY = 'sk-env-should-be-ignored'
+  check('库里没 key 时，**环境变量里的 key 不生效**', findEndpoint('zhipu-chat')?.apiKey === undefined, findEndpoint('zhipu-chat')?.apiKey)
+  check('视图也标成 none（不是 env）', listProviderViews().find((p) => p.id === 'zhipu')?.apiKeySource === 'none')
+  delete process.env.ZHIPU_API_KEY
 
   console.log('\n[内置厂商：智谱一家三个端点]')
   seedBuiltinProviders()

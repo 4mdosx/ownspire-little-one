@@ -144,7 +144,6 @@ const ENDPOINT: EndpointConfig = {
   label: '智谱',
   protocol: 'openai-chat-completions',
   baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
-  keyEnvVar: 'ZHIPU_TEST_KEY',
   // ⚠️ GLM 的 thinking 走这里。**用 `disabled` 是直接请求失败**，不是建议。
   extraBody: { thinking: { type: 'enabled' } },
 }

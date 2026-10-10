@@ -44,29 +44,25 @@ export function requireToken(): string {
 }
 
 /**
- * ⚠️ **这里曾经有一个 `requireModelKey()`，现在删了。**
+ * ⚠️ **模型配置一律不走环境变量**（2026-10-09 裁定）。
  *
- * 它硬认 `OPENAI_API_KEY`，而 key 现在**按厂商**存在 `providers.keyEnvVar` 里 ——
- * 留着它会让「配了智谱的 key」也被判成没配，且报错指向一个你没打算用的变量。
- * 启动检查改由 `server.ts` 用 `missingKeys()` 按注册表做。
+ * 这个文件曾经有过三个 env 入口，现在全删了：
  *
- * 保留这段注释是因为：下一个想加「检查 key」的人会先找这个函数，
- * 而它**必须**是查注册表的，不能是查某个固定变量名。
+ * | 删掉的 | 现在的唯一来源 |
+ * |---|---|
+ * | `OPENAI_API_KEY` 等 key 变量 + `keyEnvVar` 列 | `providers.apiKey`（界面填） |
+ * | `AGENT_MODEL`（默认模型 id） | `models` 表第一项 |
+ * | `AGENT_REASONING_EFFORT`（推理档位） | `models.reasoningEffort` 列 |
+ *
+ * 留着它们的成本不是「多几条代码路径」，而是**用户改错地方却看到「已保存」** ——
+ * 界面上填的 key 被容器注入的 env 盖掉，而提示语说的是「配置完成」。
+ * 一份真相可以有很多呈现方式，两份真相只会让人猜哪份生效。
+ *
+ * ⚠️ **保留这份注释的理由**：下一个想在这里加「读模型配置」的人会先找这个文件。
+ * 模型配置在 `src/db/registry-store.ts` 与 `src/db/schema.ts` 里，
+ * 不在这里 —— 而这个文件剩下的东西（库文件路径、鉴权 token、端口）
+ * 全是**部署参数**，不是模型参数。
  */
-
-/**
- * 推理档位（GLM-5.3 等家叫 `reasoning_effort`）。
- *
- * ⚠️ **只对 GLM 系列有意义**，判定在 `turn.ts` 的 `providerOptionsFor` 里
- * 按模型 id 前缀做，不在这里 —— 因为按 baseURL 判定会把参数发给
- * 不支持它的模型，而那是 400。
- */
-export function reasoningEffort(): 'low' | 'high' | 'max' | null {
-  const raw = process.env.AGENT_REASONING_EFFORT?.trim().toLowerCase()
-  if (!raw) return null
-  if (raw === 'low' || raw === 'high' || raw === 'max') return raw
-  throw new Error(`AGENT_REASONING_EFFORT只能是 low / high / max，收到「${raw}」。`)
-}
 
 export function port(): number {
   const raw = process.env.AGENT_PORT?.trim()
