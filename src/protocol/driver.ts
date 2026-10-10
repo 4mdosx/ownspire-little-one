@@ -74,12 +74,14 @@ export type ProtocolFamily =
  * 理由是「协议层用不到，却会被日志和错误信息带出去」。
  * 那个理由对**协议层仍然成立** —— 所以它只是「路过」，不是被解释：
  * 协议层任何代码都不读它、不写进错误信息、不打日志。
- * 之所以要搬进来，是因为 key 的来源变成了两处（库里 / 环境变量），
- * 而**优先级只能有一个地方判**。分散在 driver 里判等于没有规则。
  *
- * ⚠️ 顺带一条同源的纪律：**这里也没有 providerId** —— Adapter 不需要知道
- * 端点属于哪家厂商（key 通过 apiKey 拿，协议通过 protocol 定）。
- * 界面要按厂商分组时用 registry-store 的行视图，那是给界面看的，不是协议层的输入。
+ * ⚠️ 顺带两条同源的纪律：
+ * - **这里没有 `keyEnvVar`**（2026-10-09 再删）。key 只从库里来，
+ *   而「key 的环境变量名」是环境变量参与配置时代的产物 ——
+ *   留着它就等于给协议层留一个已经失效的输入。
+ * - **这里也没有 providerId** —— Adapter 不需要知道端点属于哪家厂商
+ *   （key 通过 apiKey 拿，协议通过 protocol 定）。
+ *   界面要按厂商分组时用 registry-store 的行视图，那是给界面看的，不是协议层的输入。
  * **协议层不解释的字段，就不该在协议层出现。**
  */
 export type EndpointConfig = {
@@ -91,15 +93,9 @@ export type EndpointConfig = {
   /** HTTP 端点。用 SDK 协议族时可以留空（SDK 有默认值）。 */
   baseUrl?: string
   /**
-   * **key 的环境变量名**，不是 key 本身。
-   * 比如 `OPENAI_API_KEY`。理由见上面 `apiKey` 的注释。
-   */
-  keyEnvVar: string
-  /**
-   * **已经解析好的 key**：库里填的值优先，没有则回退到
-   * `process.env[keyEnvVar]`。解析在 db 层做（只有一处判优先级）。
+   * **已经解析好的 key**，来自 `providers.apiKey`。解析在 db 层做。
    *
-   * undefined 表示两处都没有 —— 此时**不要自己编一句「缺少 key」**，
+   * undefined 表示库里没填 —— 此时**不要自己编一句「缺少 key」**，
    * 把 undefined 交给 SDK，它报的错误会指出这个厂商没配。
    */
   apiKey?: string
@@ -145,6 +141,43 @@ export type DriverRequest = {
    * 契约 §五。**Adapter 必须实现签名与校验** —— 那是它那侧的安全边界。
    */
   approvalSecret?: string
+  /**
+   * 取消信号。给了就必须接进 SDK 的 `abortSignal` —— **取消必须停止底层的工作**，
+   * 只会话层标记取消而模型请求继续在飞，那是假取消。
+   *
+   * 被取消的 run **不是失败**：`DriverResult.status` 必须是 `'cancelled'`，
+   * 不许发 `run.failed`（契约 §三「取消一轮」）。
+   */
+  signal?: AbortSignal
+  /**
+   * 双审批开关（契约 §五，2026-10-09）。生产路径**始终显式传递**；
+   * 字段真的缺失（老调用方）时保守按 true 处理 = 需要审批。
+   *
+   * - `businessApproval`：raven 业务工具。false = 自动通过，但事件对照发
+   *   （`approval.resolved` 带 `auto: true`）—— 审批卡片的逻辑只有一套，
+   *   审计线索（events 表）完整。
+   * - `sandboxApproval`：沙箱内工具（引擎原生能力）。对本协议的 Driver
+   *   （工具全是业务工具）是 no-op；claude 引擎消费它。
+   */
+  businessApproval?: boolean
+  sandboxApproval?: boolean
+  /**
+   * claude 引擎的会话锚（claude 侧 session id）。第一轮没有；之后每轮传回，
+   * claude 侧凭它 resume 自己的历史。其他 Driver 忽略。
+   */
+  engineSessionId?: string
+  /**
+   * claude 引擎的业务工具来源（2026-10-09 加法）。设了 = 业务工具走 raven 的
+   * MCP HTTP 端点（执行离开本进程）；不设 = 进程内包装（现状，token 半径最小）。
+   * 两种模式的审批桥一致：工具都带 mcp 前缀，businessApproval 照常判。
+   * 其他 Driver 忽略。
+   */
+  businessToolMcpUrl?: string
+  /**
+   * 上一轮审批的结论（结构化，契约 §五）。little-one 引擎把它喂进上下文重建；
+   * claude 引擎用它消费 canUseTool 里签名匹配的授权。两引擎同语义。
+   */
+  approvalResponses?: { approvalId: string; approved: boolean; reason?: string }[]
   /** 测试用：跳过审批。生产路径不要用。 */
   skipApproval?: boolean
 }
@@ -177,15 +210,23 @@ export type ChatMessage =
 /**
  * 一轮对话的结果。
  *
- * ⚠️ `status` 是契约的一部分（`done` / `stopped` / `denied`），
+ * ⚠️ `status` 是契约的一部分（`done` / `stopped` / `denied` / `cancelled`），
  * Adapter **不许自己发明**别的值 —— 前端按它分支。
+ * `cancelled` 只能由 `request.signal` 触发，不许挪作他用。
  */
 export type DriverResult = {
-  status: 'done' | 'stopped' | 'denied'
+  status: 'done' | 'stopped' | 'denied' | 'cancelled'
   steps: number
-  usage: unknown
+  /**
+   * **归一化过的用量**（2026-10-09，契约 §六 预算）。协议层只认
+   * `{ inputTokens, outputTokens }` 这个形状 —— 各 SDK 的原始 usage
+   * 字段名不同，翻译是 Adapter 的职责。拿不到就是 0，不许编。
+   */
+  usage: { inputTokens: number; outputTokens: number }
   /** 助手正文。空字符串是合法的（模型可能只调了工具没说话）。 */
   text: string
+  /** claude 引擎的会话锚（本轮产生/延续的 claude session id）。其他 Driver 不发。 */
+  engineSessionId?: string
 }
 
 /**

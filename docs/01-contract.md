@@ -24,10 +24,22 @@
 | 工具的 `inputSchema` | ✅ 冻结 | 改它等于改模型的行为 |
 | 错误 `code` | ✅ 冻结 | raven 按 code 决定文案与是否重试 |
 | 工具实现、提示词、模型选择 | ❌ 不是 | 可以随时换 |
-| 数据库表结构 | ❌ 不是 | 内部实现，但 `ensureSchema` 幂等是部署契约 |
+| 数据库表结构 | ❌ 不是（对外） | 但受下面的**持久化演进政策**约束 |
 
 **加字段永远可以，改名需要走契约版本号。** raven 与 agent 各自独立部署、版本不同步，
 所以两边都必须容忍对方多出未知事件与未知字段——**未知事件丢弃，未知字段忽略，不报错。**
+
+### 持久化演进政策（2026-10-09）
+
+数据库表结构不是对外契约，但 §六 承诺「进程重启后还能读到历史并继续对话」，而 raven
+与 little-one 是**独立升级**的 —— 这一刻起，磁盘上的形状就是 little-one 对「未来版本的
+自己」的契约，只是它没有一个名字。三条规矩把它显式化：
+
+1. **老库必须永远能被新代码打开。** 打不开 = 生产事故，不是迁移失败。
+2. **只增不删。** 加表、加列直接做（`MIGRATABLE_COLUMNS` 会自动 `ADD COLUMN`）；
+   改列名、改类型、删列必须升 `SCHEMA_VERSION`（`src/db/schema.ts`）并写迁移步骤。
+3. `_meta` 表的 `schemaVersion` 记录「这行数据是哪个结构写出来的」，让下一次改结构的
+   人有地方下钉子，而不是靠 git log 考古。
 
 ---
 
@@ -66,20 +78,37 @@ DELETE /api/sessions/:sessionId
 {
   "title": "整理今天的剪贴板",
   "tools": ["clipboard.list", "clipboard.create"],
-  "instructions": "可选的额外系统指令"
+  "instructions": "可选的额外系统指令",
+  "engine": "little-one",
+  "endpointId": "zhipu",
+  "modelId": "glm-5.3",
+  "sandboxApproval": false,
+  "businessApproval": true
 }
 ```
 
-- `tools` 省略 = 用配置里的默认工具集。
+- `tools` 省略 = 用配置里的默认工具集。**对 claude 引擎，这个字段 = 挂载的
+  MCP 业务工具白名单** —— 引擎原生工具（Bash/Edit/Read）不进这个字段，
+  它们是引擎能力，不是会话挑选的工具（2026-10-09 裁定）。
 - 未知工具名 → **400** `{"code":"unknown_tool","error":"clipboard.nope"}`。不静默丢弃。
+- **`engine`**（2026-10-09 加法）：`little-one`（默认，自研跨厂商 loop）|
+  `claude`（委托沙箱里的 claude-cli 做脱手长程任务）。未知值 → 400 `invalid_engine`。
+  claude 引擎还没接线时**建会话可以成功**，发消息时才拿 409 `engine_not_available`
+  （那时才需要沙箱就绪）。
+- **`endpointId` / `modelId`**（加法）：会话固定的端点与模型。不存在 → 400 `invalid_config`。
+  **claude 引擎强烈建议固定**：它 spawn 时从这两条 + 厂商 key 组出
+  `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`，取默认会拿到错协议的模型。
+- **`sandboxApproval` / `businessApproval`**（加法，默认 false / true）：双审批开关，见 §五。
 
-响应 **201**：
+响应 **201**（引擎与开关回显）：
 
 ```json
-{ "sessionId": "ses_01H...", "title": "...", "createdAt": 1757317217000, "tools": ["..."] }
+{ "sessionId": "ses_01H...", "title": "...", "createdAt": 1757317217000, "tools": ["..."],
+  "engine": "little-one", "sandboxApproval": false, "businessApproval": true }
 ```
 
-`GET /api/sessions` → `{ sessions: [{ sessionId, title, createdAt, updatedAt, runCount, messageCount }] }`
+`GET /api/sessions` → `{ sessions: [{ sessionId, title, createdAt, updatedAt, runCount, messageCount,
+engine, runningRunId }] }`（`engine` / `runningRunId` 为 2026-10-09 加法）
 
 `DELETE` → **200** `{ "deleted": true, "sessionId": "...", "messages": 12, "runs": 5 }`
 带计数是给 UI 用的回执（ raven 的删除纪律：**别让一次误点变成没有回执的抹除**）。
@@ -112,6 +141,56 @@ Content-Type: application/json
 | 会话不存在 | 404 | `session_not_found` |
 | 上一轮还在跑 | 409 | `run_in_progress` |
 | `content` 为空 | 400 | `empty_content` |
+| token 预算已用尽（2026-10-09 加法） | 409 | `budget_exhausted` |
+| 引擎未接线（claude 沙箱未就绪，2026-10-09 加法） | 409 | `engine_not_available` |
+
+会话详情（`GET /api/sessions/:sessionId`）响应新增（2026-10-09 加法）：
+`engine`、`sandboxApproval`、`businessApproval`、**`runningRunId`**
+（在途 run 的 id，null = 空闲。**断线重连的页面轮询它**：非 null 显示「进行中」，
+变 null 后刷新 messages；事件回放走下面的 `GET …/runs/:runId/stream`）。
+
+### 断线重连（2026-10-09 加法）
+
+```
+GET /api/sessions/:sessionId/runs/:runId/stream?after=<seq>
+```
+
+事件流从此是**事实源**：每个事件落库，SSE 帧带 `id: <seq>` 行。重连语义：
+
+- `after` 之后的已存事件**按 seq 原样回放**（含 `run.started` 与终止事件）；
+- run 还在跑 → 回放完自动**续流**，直到终止事件；
+- run 已结束 → 只回放（终止事件在回放里，客户端照常收尾）；
+- run 死于半途（interrupted）→ 回放里**没有**终止事件、流关闭 —— 按契约 §四
+  的兜底语义显示「异常中断」，权威信号看会话详情的 `runningRunId`。
+
+**所有 agent（两种引擎）统一这条语义：客户端断开不中断工作**，
+跑完落库，UI 明示「关了页面它还在跑，回来看结果」。
+
+**帧格式加法**：SSE 帧现在带 `id: <seq>` 元数据行。手写解析器只认
+`event:`/`data:` 前缀不受影响；规范解析器把它记进 lastEventId。keepalive
+仍是注释行。`?after` 缺省 = 0（全量回放）。
+
+### 取消一轮（2026-10-09 加法）
+
+```
+POST /api/sessions/:sessionId/runs/:runId/cancel
+```
+
+- **200** `{ "cancelling": true, "runId": "...", "sessionId": "..." }` —— 信号已递到。
+  ⚠️ **200 不是「已停」的回执**，只是「已开始取消」。真正的结论是流上的终止事件
+  （`run.completed`，`status: "cancelled"`）与库里的 runs 行。
+- **404** `run_not_found`：这个会话下没有这轮 run。**runId 必须归属该会话** ——
+  拿别的会话的 runId 来取消，按 404 处理，否则 404 的语义就不可信了。
+- **409** `run_not_running`：run 存在但已经结束 / 已被标记 interrupted。
+  没有可以中断的东西是「请求与状态冲突」（409），不是服务坏了（500）——
+  前端拿到 409 该刷新那一轮的状态，而不是重试。
+
+设计上只有一条硬要求：**取消必须停止底层的工作。** 信号会一路穿透到模型请求与
+在飞的工具调用。只改状态不让工作停下来，那是假取消 —— run 照样烧完剩下的步数。
+
+取消后的收尾走**正常的终止保证**：`run.completed`（`status: "cancelled"`），
+不是 `run.failed`。`cancelled` 是用户的决定，`failed` 是系统的故障，两者混在一起
+「收到终止事件就关指示器」的逻辑就得分家。
 
 ### 工具清单
 
@@ -175,8 +254,13 @@ DELETE /api/config/models/:endpointId/:id
 `apiKeySource` / `apiKeyHint`（末四位掩码）三个字段，连 `apiKey` 这个键都不存在。
 这不是「记得脱敏」，是做成了类型——想泄漏都泄漏不出去。
 
-`apiKeySource` 区分 `db`（界面填的）与 `env`（环境变量注入的），因为两者的修法不同：
-前者去界面改，后者要改部署配置。分不清的话用户会去改错地方。
+⚠️ **key 的来源只有数据库**（2026-10-09 裁定）。厂商视图里**没有** `keyEnvVar`，
+`apiKeySource` 只有 `db` 与 `none` 两个值 —— 环境变量不再参与。
+
+这条裁定的原因是「两份真相」的代价：`apiKeySource` 原本要区分 `db` 与 `env`，
+而区分出来之后用户还是得猜哪份生效。唯一来源让这个问题消失。
+
+改 key 只有一个地方：这里。
 
 | 情况 | 状态码 | code |
 |---|---|---|
@@ -202,14 +286,20 @@ DELETE /api/config/models/:endpointId/:id
 
 | event | data | 何时发 |
 |---|---|---|
-| `run.started` | `{ runId, sessionId, startedAt }` | 流开始，第一个事件 |
+| `run.started` | `{ runId, sessionId, startedAt, engine? }` | 流开始，第一个事件 |
 | `message.delta` | `{ runId, text }` | 助手正文增量 |
 | `tool.called` | `{ runId, callId, tool, input }` | 模型请求了一个工具，**执行之前** |
 | `tool.completed` | `{ runId, callId, tool, ok, output, durationMs }` | 工具结束（`ok:false` 也发） |
-| `approval.requested` | `{ runId, callId, tool, input, risk, reason }` | 工具需要授权，**执行之前** |
-| `approval.resolved` | `{ runId, callId, approved }` | 授权有结论了 |
+| `approval.requested` | `{ runId, callId, tool, input, risk, reason, approvalId? }` | 工具需要授权，**执行之前** |
+| `approval.resolved` | `{ runId, callId, approved, auto? }` | 授权有结论了（`auto` 为 2026-10-09 加法） |
 | `run.completed` | `{ runId, status, steps, usage }` | 正常结束，**最后一个事件** |
 | `run.failed` | `{ runId, code, error }` | 出错，**最后一个事件** |
+
+`run.started.engine`（加法）：哪个引擎在跑（`little-one` / `claude`）。
+`approval.resolved.auto`（加法）：**会话开关自动通过**时为 true ——
+自动通过也发完整事件对，审计与审批卡片逻辑对两种配置只有一套（§五）。
+另外 **usage 自 2026-10-09 起是归一化形状** `{ inputTokens, outputTokens }`
+（token 数，按厂商/模型的分组统计见 `GET /api/usage`），不再是各 SDK 的原始形状。
 
 所有 `data` 都额外带 `runId`—— raven 可能同时开多个流，不带就得靠闭包猜。
 
@@ -250,9 +340,12 @@ DELETE /api/config/models/:endpointId/:id
 | `done` | 模型正常收尾 |
 | `stopped` | 达到步数上限（默认 20 步），主动停止 |
 | `denied` | 用户拒绝了某个工具的授权，模型接受了这个结论并收尾 |
+| `cancelled` | 用户通过取消接口主动停掉（2026-10-09 加值，加法不升版本） |
 
 `stopped` **不是错误**。步数上限是保护机制，触发时应当如实告诉用户「达到步数上限」，
 不要显示成「失败了」——那是误导。
+`cancelled` 与 `stopped` 分列的理由同理：**stopped 是保护机制，cancelled 是用户决定**，
+前端对两者的文案不应该共用一句「已停止」。
 
 ### `run.failed` 的 `code`
 
@@ -302,12 +395,58 @@ DELETE /api/config/models/:endpointId/:id
 模型配置，缺 key 或缺模型 id 会直接拒绝启动（容器起不来，compose 会报）。
 它存在是为了守住「配置在运行中被改掉」这条路径。
 
+### 快终止裁定：为什么这两个 code 不做循环内自愈（2026-10-09）
+
+`invalid_tool_input` 与 `model_content_filtered` 有一个共同点：**它们是模型自己的、
+理论上可修正的错误** —— 把校验错误喂回去、让模型换个说法，循环就能自己继续。
+OpenHands 就是这么做的（feed back → nudge → 继续），长程编码任务靠这个活。
+
+**little-one 明确不这么做。这两个 code 就是要终止 run，理由写在这里防止将来被当成
+缺陷改掉：**
+
+- 这个 Runtime 的产品形态是**人在环**：更快地把控制权交还给用户，让用户看到错在哪、
+  改一下说法重发，比一个自愈循环更符合使用方式。用户修正一次的成本，低于盯着一个
+  「正在自己挣扎」的进度条猜它能不能出来。
+- **完全脱手的长程任务不属于这里。** 那种任务的正确形态是专业工具：raven 执行侧的
+  脚本、调度、带重试预算的作业。Runtime 给它递工具就够了，不该把「挣扎」做进循环里。
+- 自愈不是免费的：每一次 feed-back 都是一轮真实的模型调用（钱与时间），而剪贴板级
+  工具的单步成本不值得这个开销。步骤上限烧在同一个错误上重复十次，是最糟的组合。
+
+如果将来真要做自愈，形状是加法：`tool.rejected` 之类的新事件把校验错误作为观察喂回
+模型，`run.failed` 的语义不动 —— 那需要先有真实的长程用例撑着，现在没有。
+
 ---
 
 ## §五 授权流程
 
 权限由**代码强制**，不由 Prompt 保证。这是整套设计里最硬的一条边界：
 **模型说「已获授权」不算，Prompt 里写「你可以随便删」也不算。**
+
+### 双审批开关（2026-10-09）
+
+会话级两个**独立**开关（§三 创建时设置，缺省值加粗）：
+
+| 开关 | 管什么 | 缺省 | 理由 |
+|---|---|---|---|
+| `sandboxApproval` | **沙箱内工具**（引擎原生能力：文件、终端） | **关**（自动通过） | claude 引擎的定位是脱手长程任务，沙箱隔离就是安全机制；每个 Bash 都弹审批就不是脱手了 |
+| `businessApproval` | **raven 业务工具**（clipboard/todo/…，MCP 挂载） | **开**（需要审批） | 业务数据是治理核心，回执与审批不可绕 |
+
+裁定与边界：
+
+1. **两开关互不影响。** `sandboxApproval=false` 只放行沙箱内工具；
+   业务工具的审批**无条件保留**，不随它联动。
+2. **自动通过也发完整事件对**：`approval.requested` → `approval.resolved`
+   （`approved: true, auto: true`）。不静默吞 —— 审批卡片的前端逻辑
+   对两种配置只有一套，events 表的审计线索也完整。
+3. **little-one 引擎会话里 `sandboxApproval` 是 no-op**：它的工具全是业务工具。
+4. 开关在特殊时刻可手动改（机制留在会话创建参数里），但**默认值就是产品定位**：
+   沙箱放行 + 业务审批，别在 UI 上诱导用户两个全关。
+5. **`approvalId`（2026-10-09 加法）**：待批事件携带的签名凭证，前端原样放进
+   `approvalResponses` 回传。little-one 引擎由 SDK 签发；claude 引擎由 Driver 以
+   HMAC 把 approvalId 与工具名+入参绑定 —— **入参被篡改的旧 approvalId 必判否**，
+   消费位置在下一轮 resume 的 canUseTool（`scripts/drivers/verify-claude.ts`
+   有「篡改 → deny」的断言）。claude 引擎需要审批的操作本轮以 deny 收尾，
+   模型收尾或绕行；结论下一轮消费 —— 与「决策走下一条消息」同形。
 
 ### 顺序
 
@@ -369,6 +508,63 @@ Instance（本进程，一用户一实例）
   `interrupted` —— 半轮对话恢复不了，硬接会产出更糟的东西。
 - **`interrupted` 不是 `run.failed`**：它没有 `code`，是一段历史，不是一个错误。
   raven 显示成「这一轮中断了，可以重新问一遍」。
+
+### 多引擎（2026-10-09）
+
+会话有 `engine` 字段（§三）。分工是**产品裁定**，不是技术取舍：
+
+- **little-one**（自研跨厂商 loop）：业务面的轻量调度 —— 业务工具 + 快终止 +
+  人在环。轻任务、低单步成本、用户随问随改。
+- **claude**（沙箱里的 claude-cli，经 Driver 委托）：脱手的长程任务 ——
+  文件、代码、脚本。引擎原生工具自带入场，raven 不复刻工作区能力；
+  业务读写仍经 MCP 走 raven 治理（§五）。
+
+两种引擎共享同一份 SSE 契约、同一套审批卡片、同一个 session 账本 ——
+**归一化的锚是契约，不是引擎**。claude 引擎 spawn 时用会话固定的
+`endpointId`/`modelId` + 厂商 key 组出 `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY`，
+配置目录零改动（复用现有表）。
+
+### token 预算（2026-10-09）
+
+- **记账单位是 token，全程不出现钱。** 定价随厂商与时间变，换算成钱是
+  库外面的事 —— raven 与 little 的任何接口、字段、日志都不含金额。
+- **按厂商/模型分开统计**：`GET /api/usage` 返回 totals + byModel 分组
+  + 预算余量。落账在 `usageLedger`，一次 run 一行。
+- **上限是实例级的一个数**（配置目录 `PUT /api/config/budget`，null = 不设防），
+  检查点在 **run 启动前**：累计已超 → **409 `budget_exhausted`**（真状态码，
+  与 `run_in_progress` 同理必须在开流前判）。
+- **运行中逐 token 掐断做不到**（usage 在 run 收尾才给全量）——
+  运行中的超支风险由工具调用次数上限（`maxSteps`，对 claude 引擎映射为
+  工具调用次数）兜底，由 `stopped` 如实收尾。
+- `run.completed.usage` 是归一化形状 `{ inputTokens, outputTokens }`（§四）。
+
+### 跨版本恢复：历史与工具是两回事（2026-10-09）
+
+会话在升级前后被继续使用时（raven 与 little-one 独立部署，这是常态而不是例外），
+两条裁定，来源是 OpenHands 的恢复契约（「工具只能加不能删，因为 LLM 可能已经被
+告诉过它们」）：
+
+1. **历史无条件重放。** 已落库的工具调用与结果是**事实，不是能力** ——
+   模型上一轮调过什么、拿到什么，照原样进上下文。工具的 `inputSchema` 变了、
+   实现换了，都不影响旧记录的回放。
+2. **注册表里已经不存在的工具，不再暴露给模型，跳过并警告，不拒跑。**
+   会话创建时工具名已校验并冻结（§三 的 `unknown_tool` → 400 只发生在创建时）；
+   但「会话创建之后工具被下线」如果变成拒跑，一次升级就能把所有旧会话变成
+   不可用 —— 那是把内部清单的变动变成了对外可用性的破坏。
+   实现位置：组装层发消息时解析 `session.tools`，缺的名字 `console.warn` 后跳过
+   （`src/server.ts`）。
+
+（对应地，`runs.parentRunId` 预留列已在库中 —— run 的血缘现在没有写入方，
+先占位，见 `src/db/schema.ts` 的注释。）
+
+### 预留（2026-10-09，均未实现，先占位防退化）
+
+| 预留 | 位置 | 打算什么时候用 |
+|---|---|---|
+| `runs.parentRunId` 列 | `runs` 表 | 要做「从哪断的 / 重试链」时直接用，不用迁移 |
+| `run.completed.stopDetail` 字段 | §四 事件表 | `stopped` 的如实延伸：步数是不是烧在同一个错误上 |
+
+（~~预算守卫~~ 已于 2026-10-09 提级实现，见上面「token 预算」一节。）
 
 ---
 

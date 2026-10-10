@@ -91,7 +91,7 @@ async function main(): Promise<void> {
     // 没有 key 时模型调用必然失败，所以真跑起来应该是 run.failed。
     // 两种都合法，这里只断言形状对。
     check('run.completed 带 status', typeof body.status === 'string')
-    check('status 是契约枚举之一', ['done', 'stopped', 'denied'].includes(body.status ?? ''), body.status)
+    check('status 是契约枚举之一', ['done', 'stopped', 'denied', 'cancelled'].includes(body.status ?? ''), body.status)
   } else {
     const body = terminal.data as { code?: string; error?: string }
     console.log(`  run.failed: code=${body.code} error=${String(body.error).slice(0, 80)}`)

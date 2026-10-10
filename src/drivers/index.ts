@@ -1,5 +1,6 @@
 import type { AgentDriver, DriverRegistry } from '../protocol/driver.js'
 import { vercelAiDriver } from '../drivers/vercel-ai/driver.js'
+import { createClaudeDriver, isClaudeCliAvailable } from './claude/driver.js'
 
 /**
  * Driver 注册表。
@@ -19,8 +20,17 @@ import { vercelAiDriver } from '../drivers/vercel-ai/driver.js'
  * 协议层、契约、raven，全部不动。
  */
 
+/**
+ * claude 引擎按 CLI 存在性注册：沙箱里装了 claude-cli 才有 `handles: 'claude'`，
+ * 发消息前的 409 `engine_not_available` 闸（server.ts）靠 `drivers.list()` 判断
+ * —— 注册即承诺可用。探测失败只是引擎缺席，runtime 照常启动。
+ */
+const claudeDriver: AgentDriver | null = isClaudeCliAvailable()
+  ? createClaudeDriver()
+  : null
+
 /** ⚠️ handles 要覆盖全，否则 `get()` 会抛错而调用点可能没处理。 */
-const DRIVERS: AgentDriver[] = [vercelAiDriver]
+const DRIVERS: AgentDriver[] = claudeDriver ? [vercelAiDriver, claudeDriver] : [vercelAiDriver]
 
 const registry: DriverRegistry = {
   get(endpointProtocol: string): AgentDriver {

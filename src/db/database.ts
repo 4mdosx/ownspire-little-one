@@ -2,7 +2,14 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { resolveDbFile } from '../config/env.js'
-import { LEGACY_INDEXES, LEGACY_TABLES, MIGRATABLE_COLUMNS, SCHEMA_SQL } from './schema.js'
+import {
+  DROPPABLE_COLUMNS,
+  LEGACY_INDEXES,
+  LEGACY_TABLES,
+  MIGRATABLE_COLUMNS,
+  SCHEMA_SQL,
+  SCHEMA_VERSION,
+} from './schema.js'
 
 /**
  * 连接与初始化。规矩来自 atlas / raven，都是踩过的：
@@ -65,6 +72,32 @@ export function ensureSchema(): void {
     }
   }
   database.exec(SCHEMA_SQL)
+  // ⚠️ **删掉的列要单独查，方向与加列相反。**
+  //
+  // `CREATE TABLE IF NOT EXISTS` 不动已存在的表，所以新 schema 删了一列之后，
+  // 旧库那张表**仍然带着那一列** —— 而所有引用它的代码都已经删了。
+  // 不处理的话症状是「旧库能跑、新库也能跑，但两者的行为没人验证过」，
+  // 而这类不一致会在下一次改结构时才暴露，指向错误的行。
+  //
+  // 自动修的依据是实测：在真有数据的库上验过，`DROP COLUMN` 不重建表、不丢数据
+  // （见 schema.ts 里 DROPPABLE_COLUMNS 的注释）。
+  // **但失败时不重试、不绕过** —— 失败说明有本文件不知道的依赖（索引/外键），
+  // 而绕过它正是静默损坏的起点。
+  for (const item of DROPPABLE_COLUMNS) {
+    const columns = database.prepare(`PRAGMA table_info(${item.table})`).all() as Array<{ name: string }>
+    if (!columns.some((column) => column.name === item.column)) continue
+    try {
+      database.exec(`ALTER TABLE ${item.table} DROP COLUMN ${item.column}`)
+    } catch (error) {
+      throw new Error(
+        `迁移失败：${item.table}.${item.column} 删不掉 —— ` +
+          `${error instanceof Error ? error.message : String(error)}\n` +
+          `数据库未被修改。${item.reason}\n` +
+          '若该列被索引或外键引用，先去掉那些引用，或删掉数据库重建。'
+      )
+    }
+    console.log(`[agent] 已迁移：${item.table} 删掉 ${item.column} —— ${item.reason}`)
+  }
   // ⚠️ **`CREATE TABLE IF NOT EXISTS` 对已存在的表不做任何事。**
   // 所以 schema.sql 里加了列，库里那张表不会跟着变 —— 而服务照样起来，
   // 于是读那一列的代码全拿到 undefined。这类沉默的不一致最难查。
@@ -88,6 +121,12 @@ export function ensureSchema(): void {
       throw new Error(`检测到过时索引 ${index}：${reason} 数据库未被修改。`)
     }
   }
+  // 持久化演进政策（契约 §一）：把「这行数据是哪个结构写出来的」记进库本身。
+  // INSERT OR IGNORE —— 已有值说明库里是旧结构写的数据，保留旧值；
+  // 升 SCHEMA_VERSION 时由对应的迁移步骤负责改写它，这里不覆盖。
+  database
+    .prepare('INSERT OR IGNORE INTO _meta (key, value) VALUES (:key, :value)')
+    .run({ key: 'schemaVersion', value: String(SCHEMA_VERSION) })
   schemaReady = true
 }
 

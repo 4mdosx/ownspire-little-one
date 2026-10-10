@@ -122,7 +122,7 @@ export function createVercelAiDriver(createModel: ModelFactory = defaultModelFac
       tools: toolSet,
       stopWhen: isStepCount(request.maxSteps),
       // ⚠️ **必须是按名字的对象**（见文件头第1 条）。
-      toolApproval: buildApprovalConfig(riskByTool, request.skipApproval === true),
+      toolApproval: buildApprovalConfig(riskByTool, request),
       ...(request.approvalSecret
         ? { experimental_toolApprovalSecret: request.approvalSecret }
         : {}),
@@ -131,6 +131,9 @@ export function createVercelAiDriver(createModel: ModelFactory = defaultModelFac
     const result = await agent.stream({
       messages: toSdkMessages(request.messages.filter((message) => message.role !== 'system')) as ModelMessage[],
       ...providerOptionsFor(request),
+      // ⚠️ 取消必须穿透到 SDK：abort 之后流会结束、在飞的工具调用会被中断。
+      // 只在会话层记一个「已取消」而模型请求继续烧 token，那是假取消。
+      ...(request.signal ? { abortSignal: request.signal } : {}),
       onStepEnd: (step) => {
         for (const call of step.toolCalls ?? []) {
           announce(call.toolCallId, call.toolName, call.input)
@@ -183,11 +186,21 @@ export function createVercelAiDriver(createModel: ModelFactory = defaultModelFac
             denied = true
             hooks.onApprovalDenied({ callId, tool: toolCall.toolName })
           }
-          // 同上：自动批准的那次「响应」没有告知价值。
+          // 同上：skipApproval（测试通道）的那次「响应」没有告知价值。
           if (request.skipApproval === true) break
           emit({
             name: 'approval.resolved',
-            data: { runId: request.runId, callId, approved },
+            data: {
+              runId: request.runId,
+              callId,
+              approved,
+              // 会话开关自动通过时打上 auto 标记（契约 §五）：审批卡片
+              // 能区分「用户批的」和「开关放行的」，审计线索也完整。
+              ...(request.businessApproval === false &&
+              (riskByTool.get(toolCall.toolName) ?? 'write') !== 'read'
+                ? { auto: true }
+                : {}),
+            },
           })
           break
         }
@@ -247,11 +260,16 @@ export function createVercelAiDriver(createModel: ModelFactory = defaultModelFac
           break
         }
 
-        case 'error':
+        case 'error': {
+          // ⚠️ **取消先于一切错误判断**：abort 之后 SDK 会以一个 error part
+          // 收场（通常是 AbortError），但契约上这是正常收尾 —— 循环到此结束，
+          // 下面按 `cancelled` 返回，不走 `run.failed`。
+          if (request.signal?.aborted) break
           // ⚠️ 模型侧的失败（配额、网络、内容过滤）在这里。
           // 必须归到 `model_error` —— 前端按 code 分支，
           // 显示成「Runtime 崩了，请重试」会误导用户去重启服务。
           throw normalizeError((part as { error: unknown }).error)
+        }
 
         default:
           // 未知 part 忽略。SDK 会加新 part 类型，
@@ -261,18 +279,27 @@ export function createVercelAiDriver(createModel: ModelFactory = defaultModelFac
     }
 
     const steps = await result.steps
-    const [usage, text] = await Promise.all([
+    const [rawUsage, text] = await Promise.all([
       Promise.resolve(result.usage).catch(() => null),
-      result.text,
+      // ⚠️ 被取消的流取不到完整正文 —— abort 之后读 text 会 reject，
+      // 那是取消的余波，不是失败；只有非取消路径才让它抛。
+      Promise.resolve(result.text).catch((error: unknown) => {
+        if (request.signal?.aborted) return ''
+        throw error
+      }),
     ])
 
-    const status: DriverResult['status'] = denied
-      ? 'denied'
-      : steps.length >= request.maxSteps
-        ? 'stopped'
-        : 'done'
+    // ⚠️ 取消的判定**只看信号本身**，优先于 denied / stopped：
+    // 「用户按了停止」的语义必须盖过「这一步恰好有工具被拒」。
+    const status: DriverResult['status'] = request.signal?.aborted
+      ? 'cancelled'
+      : denied
+        ? 'denied'
+        : steps.length >= request.maxSteps
+          ? 'stopped'
+          : 'done'
 
-    return { status, steps: steps.length, usage, text }
+    return { status, steps: steps.length, usage: normalizeUsage(rawUsage), text }
   },
   }
 }
@@ -408,18 +435,45 @@ function defaultModelFactory(request: DriverRequest): LanguageModel {
  */
 function buildApprovalConfig(
   riskByTool: Map<string, Risk>,
-  skipApproval: boolean
+  request: DriverRequest
 ): Record<string, 'approved' | 'user-approval' | 'not-applicable'> {
+  // 双审批开关（契约 §五）：businessApproval=false → 业务工具自动通过。
+  // 与 skipApproval 的区别在事件：**自动通过照发事件对（带 auto: true）**，
+  // skipApproval 是测试通道，事件整个不发。缺省（undefined）= 需要审批。
+  const autoApprove = request.businessApproval === false
   const config: Record<string, 'approved' | 'user-approval' | 'not-applicable'> = {}
   for (const [name, risk] of riskByTool) {
-    if (skipApproval) {
+    if (request.skipApproval) {
       config[name] = 'approved'
       continue
     }
-    config[name] =
-      risk === 'read' ? 'not-applicable' : 'user-approval'
+    if (risk === 'read') {
+      config[name] = 'not-applicable'
+      continue
+    }
+    config[name] = autoApprove ? 'approved' : 'user-approval'
   }
   return config
+}
+
+/**
+ * SDK 的 usage 字段名两代不一样（inputTokens/outputTokens vs
+ * promptTokens/completionTokens），协议层只认归一化形状 —— 翻译在这里。
+ * 拿不到就是 0：**预算宁可少记不可多记**（多记会提前掐断，少记只是晚一步）。
+ */
+function normalizeUsage(raw: unknown): { inputTokens: number; outputTokens: number } {
+  const source = typeof raw === 'object' && raw !== null ? (raw as Record<string, unknown>) : {}
+  const pick = (...keys: string[]): number => {
+    for (const key of keys) {
+      const value = source[key]
+      if (typeof value === 'number' && Number.isFinite(value)) return value
+    }
+    return 0
+  }
+  return {
+    inputTokens: pick('inputTokens', 'promptTokens', 'input_tokens'),
+    outputTokens: pick('outputTokens', 'completionTokens', 'output_tokens'),
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -182,12 +182,12 @@ export function createFakeDriver(options: FakeDriverOptions): { driver: AgentDri
 
       emit({
         name: 'run.completed',
-        data: { runId: request.runId, status, steps: options.script.length, usage: null },
+        data: { runId: request.runId, status, steps: options.script.length, usage: { inputTokens: 0, outputTokens: 0 } },
       })
       return {
         status,
         steps: options.script.length,
-        usage: null,
+        usage: { inputTokens: 0, outputTokens: 0 },
         text,
       }
     },
@@ -209,7 +209,17 @@ export function createFakeStore(overrides: Partial<import('../../src/protocol/tu
   const base: import('../../src/protocol/turn.js').TurnStore = {
     findSession(sessionId) {
       record('findSession')
-      return { id: sessionId, instructions: null, tools: JSON.stringify([{ name: 'echo', risk: 'read' }]) }
+      return {
+        id: sessionId,
+        instructions: null,
+        tools: JSON.stringify([{ name: 'echo', risk: 'read' }]),
+        engine: 'little-one',
+        endpointId: null,
+        modelId: null,
+        engineSessionId: null,
+        sandboxApproval: false,
+        businessApproval: true,
+      }
     },
     hasRunningRun() {
       record('hasRunningRun')
@@ -241,11 +251,23 @@ export function createFakeStore(overrides: Partial<import('../../src/protocol/tu
     },
     resolveEndpoint() {
       record('resolveEndpoint')
-      return { id: 'fake', label: 'fake', protocol: FAKE_PROTOCOL, keyEnvVar: 'FAKE_KEY' }
+      return { id: 'fake', label: 'fake', protocol: FAKE_PROTOCOL }
     },
     resolveModel() {
       record('resolveModel')
       return { id: 'fake-model', label: 'Fake', endpointId: 'fake' }
+    },
+    recordUsage() {
+      record('recordUsage')
+    },
+    usageTotals() {
+      return { inputTokens: 0, outputTokens: 0 }
+    },
+    budgetLimit() {
+      return null
+    },
+    setEngineSession() {
+      record('setEngineSession')
     },
   }
 
@@ -266,5 +288,4 @@ export const TEST_ENDPOINT: EndpointConfig = {
   id: 'fake',
   label: 'Fake',
   protocol: FAKE_PROTOCOL,
-  keyEnvVar: 'FAKE_KEY',
 }

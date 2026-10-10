@@ -25,7 +25,6 @@ import { now } from '../lib/ids.js'
 type ProviderRow = {
   id: string
   label: string
-  keyEnvVar: string
   apiKey: string | null
   defaultProtocol: string
   createdAt: number
@@ -41,7 +40,6 @@ type EndpointRow = {
   extraBody: string | null
   enabled: number
   providerLabel?: string
-  providerKeyEnvVar?: string
   providerApiKey?: string | null
   providerDefaultProtocol?: string
 }
@@ -76,42 +74,39 @@ export function toProtocol(raw: string): ProtocolFamily {
 
 /** 一次 JOIN 把端点与厂商都取出来 —— key 在厂商上，不在端点上。 */
 const ENDPOINT_SELECT = `
-  SELECT e.*, p.label AS providerLabel, p.keyEnvVar AS providerKeyEnvVar,
+  SELECT e.*, p.label AS providerLabel,
          p.apiKey AS providerApiKey,
          p.defaultProtocol AS providerDefaultProtocol
     FROM endpoints e JOIN providers p ON p.id = e.providerId`
 
 /**
- * key 的取值优先级 —— **全项目只有这一处判**。
+ * key 的取值 —— **全项目只有这一处**。
  *
- * 库里填的（管理界面）优先，环境变量兜底（容器部署的既有方式）。
- * 顺序反过来的后果是：容器里注入的 env 会盖掉用户在界面上刚填的 key，
- * 而界面显示「已保存」—— 那比不提供界面更糟。
+ * ⚠️ **只有一个来源：`providers.apiKey`。** 环境变量不再是配置来源
+ * （2026-10-09 删）。此前这里是「库里优先、env 兜底」的两级判定，
+ * 而两级判定的成本不在代码量上：用户在界面上看到「已保存」，
+ * 真正生效的却可能是容器里注入的那把 —— 去改错地方的人不在少数。
  *
  * ⚠️ 两者都没有时返回 undefined，**不返回空字符串**：
  * SDK 用 `undefined` 报「缺少凭据」，而空字符串会被它当成「有一把空 key」
  * 于是请求照发、拿回一个语焉不详的 401。
  */
-export function resolveProviderKey(row: { apiKey?: string | null; keyEnvVar: string }): string | undefined {
+export function resolveProviderKey(row: { apiKey?: string | null }): string | undefined {
   const fromDb = row.apiKey?.trim()
-  if (fromDb) return fromDb
-  const fromEnv = process.env[row.keyEnvVar]?.trim()
-  return fromEnv ? fromEnv : undefined
+  return fromDb ? fromDb : undefined
 }
 
 function toEndpoint(row: EndpointRow): EndpointConfig {
-  if (!row.providerKeyEnvVar) {
-    throw new ConfigError(`端点 ${row.id} 关联的厂商 ${row.providerId} 不存在。数据不完整。`)
-  }
-  const apiKey = resolveProviderKey({ apiKey: row.providerApiKey, keyEnvVar: row.providerKeyEnvVar })
+  // ⚠️ 这里曾有一个「厂商不存在」的检查，靠 `keyEnvVar` 为空来判 ——
+  // 而ENDPOINT_SELECT 是 INNER JOIN，厂商不存在就**根本没有这一行**，
+  // 那个检查永远不成立。它给人「这里校验过厂商存在性」的错觉，实际没有。
+  const apiKey = resolveProviderKey({ apiKey: row.providerApiKey })
   return {
     id: row.id,
     label: row.label,
     //端点自己的协议优先，留空则继承厂商默认。
     protocol: toProtocol(row.protocol ?? row.providerDefaultProtocol ?? 'openai-chat-completions'),
     ...(row.baseUrl ? { baseUrl: row.baseUrl } : {}),
-    // key 的环境变量名**从厂商取** —— 端点不持有凭据。
-    keyEnvVar: row.providerKeyEnvVar,
     ...(apiKey ? { apiKey } : {}),
     ...(row.extraBody ? { extraBody: JSON.parse(row.extraBody) as Record<string, unknown> } : {}),
   }
@@ -155,7 +150,16 @@ export function findEndpoint(id: string): EndpointConfig | undefined {
  */
 export function firstModel(endpointId?: string): ModelConfig | undefined {
   const list = listModels()
-  return endpointId ? list.find((model) => model.endpointId === endpointId) : list[0]
+  if (endpointId) return list.find((model) => model.endpointId === endpointId)
+  // 不指定端点 = 「给我一个能用的」—— **可用优先**：有 key 的厂商端点排前。
+  // 此前是纯字母序,排第一的可能挂在一个没配 key 的端点上
+  // （症状:每次对话都报「OpenAI API key is missing」,而配了 key 的模型明明在表里）。
+  return usableModelList()[0] ?? list[0]
+}
+
+/** 挂在「配了 key 的启用端点」上的模型,**保持 listModels 的排序**。 */
+export function usableModelList(): ModelConfig[] {
+  return listModels().filter((model) => findEndpoint(model.endpointId)?.apiKey !== undefined)
 }
 
 export function findModel(modelId: string, endpointId?: string): ModelConfig | undefined {
@@ -176,6 +180,14 @@ export function listProviders(): ProviderRow[] {
   return all<ProviderRow>('SELECT * FROM providers ORDER BY label')
 }
 
+/** 用量账本的厂商归属（契约 §六）。端点不存在时返回端点 id 兜底 —— 账不能丢。 */
+export function findProviderId(endpointId: string): string {
+  const row = get<{ providerId: string }>('SELECT providerId FROM endpoints WHERE id = :id', {
+    id: endpointId,
+  })
+  return row?.providerId ?? endpointId
+}
+
 // ---------------------------------------------------------------------------
 // 出口：脱敏视图
 // ---------------------------------------------------------------------------
@@ -193,27 +205,22 @@ export function listProviders(): ProviderRow[] {
 export type ProviderView = {
   id: string
   label: string
-  /** 兜底的环境变量名。界面上要显示它 —— 用户得知道还能从哪儿配。 */
-  keyEnvVar: string
-  /** key 是否已配置（库里或环境变量里任一处有）。 */
+  /** key 是否已配置（库里有没有值）。 */
   apiKeySet: boolean
-  /** key 来源。分清「界面上填的」与「环境变量注入的」，否则用户会去改错地方。 */
-  apiKeySource: 'db' | 'env' | 'none'
+  /** key 来源。**只有 `db` 与 `none`** —— 环境变量已不再是来源（2026-10-09 删）。 */
+  apiKeySource: 'db' | 'none'
   apiKeyHint: string | null
   defaultProtocol: ProtocolFamily
   updatedAt: number
 }
 
 export function providerView(row: ProviderRow): ProviderView {
-  const fromDb = row.apiKey?.trim() ?? ''
-  const fromEnv = !fromDb ? (process.env[row.keyEnvVar]?.trim() ?? '') : ''
-  const effective = fromDb || fromEnv
+  const effective = row.apiKey?.trim() ?? ''
   return {
     id: row.id,
     label: row.label,
-    keyEnvVar: row.keyEnvVar,
     apiKeySet: effective !== '',
-    apiKeySource: fromDb ? 'db' : fromEnv ? 'env' : 'none',
+    apiKeySource: effective === '' ? 'none' : 'db',
     apiKeyHint: effective === '' ? null : `****${effective.slice(-4)}`,
     defaultProtocol: toProtocol(row.defaultProtocol),
     updatedAt: row.updatedAt,
@@ -282,7 +289,6 @@ export function listEndpointRows(): EndpointRowView[] {
 export function upsertProvider(input: {
   id: string
   label: string
-  keyEnvVar: string
   defaultProtocol: ProtocolFamily
   apiKey?: string
   clearApiKey?: boolean
@@ -297,11 +303,10 @@ export function upsertProvider(input: {
     : (input.apiKey?.trim() || current?.apiKey || null)
 
   run(
-    `INSERT INTO providers (id, label, keyEnvVar, apiKey, defaultProtocol, createdAt, updatedAt)
-     VALUES (:id, :label, :keyEnvVar, :apiKey, :defaultProtocol, :ts, :ts)
+    `INSERT INTO providers (id, label, apiKey, defaultProtocol, createdAt, updatedAt)
+     VALUES (:id, :label, :apiKey, :defaultProtocol, :ts, :ts)
      ON CONFLICT(id) DO UPDATE SET
        label           = excluded.label,
-       keyEnvVar       = excluded.keyEnvVar,
        apiKey          = excluded.apiKey,
        defaultProtocol = excluded.defaultProtocol,
        updatedAt       = :ts`,
@@ -311,7 +316,6 @@ export function upsertProvider(input: {
     {
       id: input.id,
       label: input.label,
-      keyEnvVar: input.keyEnvVar,
       defaultProtocol: input.defaultProtocol,
       apiKey: nextApiKey,
       ts: now(),
@@ -499,8 +503,10 @@ export function deleteProvider(
 /**
  * 内置厂商与端点。**启动时幂等写入**，所以不额外配置也能跑。
  *
- * ⚠️ **只写 key 的环境变量名**，不写 key 本身 —— 所以 key 仍要靠环境变量提供。
- * 这样「配置在库、凭据在环境」这条边界不会被自己破坏。
+ * ⚠️ **不写 key。** key 只能由管理界面填入（`providers.apiKey`），
+ * 环境变量不再参与 —— 所以刚 seed 完的库一定是「没配 key」的状态，
+ * 界面上的表现是每个厂商都显示「未配置 key」，那是对的：
+ * 它说的是「确实还没配」，而不是「配在别处你看不见」。
  *
  * ⚠️ **智谱有三个端点、两种协议**，这是「Adapter 按协议切」的现实依据：
  * 同一个 key，`/api/paas/v4` 走 OpenAI Chat，`/api/anthropic` 走 Anthropic Messages。
@@ -509,19 +515,16 @@ export function seedBuiltinProviders(): void {
   upsertProvider({
     id: 'openai',
     label: 'OpenAI',
-    keyEnvVar: 'OPENAI_API_KEY',
     defaultProtocol: 'openai-chat-completions',
   })
   upsertProvider({
     id: 'zhipu',
     label: '智谱 GLM',
-    keyEnvVar: 'ZHIPU_API_KEY',
     defaultProtocol: 'openai-chat-completions',
   })
   upsertProvider({
     id: 'deepseek',
     label: 'DeepSeek',
-    keyEnvVar: 'DEEPSEEK_API_KEY',
     defaultProtocol: 'openai-chat-completions',
   })
 
@@ -571,65 +574,42 @@ export function seedBuiltinProviders(): void {
 }
 
 /**
- * 默认模型（`/api/models` 的 `default` 字段用）。
- *
- * ⚠️ **优先按 `AGENT_MODEL` 找，找不到才退到第一个可用模型。**
- * 「退到第一个」比「报错」好用的场景是：库里配好了模型、
- * 但环境变量还没设（第一次部署的常见状态）。
- */
-/**
- * **把环境变量里指定的模型补进 models 表。** 幂等。
- *
- * ## 为什么需要这一步
- *
- * 配置有两处来源：`.env`（`AGENT_MODEL`）与库（`models` 表）。只有前者时
- * 库里查不到该模型，于是「明明配了模型」却跑不起来。与其让两处配置
- * 必须手工同步（迟早不同步），不如**启动时把环境变量的那一个补进库** ——
- * 方向是单向的：环境变量 → 库，库是唯一真相。
- *
- * ⚠️ 端点只能猜「第一个启用的」。要精确指定就先在库里建好模型，
- * 那时这个函数什么都不做。
- */
-/**
- * **真能用的端点** —— 启用、且它的厂商 key 在环境里。
+ * **真能用的端点** —— 启用、且它的厂商在库里填了 key。
  *
  * ## 为什么这是启动检查的真正不变量
  *
  * 「所有厂商都有 key」是个**过强**的要求：内置厂商是自动 seed 的，
- * 用它做检查等于「不配 DeepSeek 的 key 就起不来」，而你可能根本不用 DeepSeek。
+ * 用它做检查等于「不填 DeepSeek 的 key 就起不来」，而你可能根本不用 DeepSeek。
  *
-  * 真正要保证的是**至少有一个**端点能连上；其余缺 key 的记一条警告就够。
+ * 真正要保证的是**至少有一个**端点能连上；其余缺 key 的记一条警告就够。
  */
 export function usableEndpoints(): EndpointConfig[] {
-  return listEndpoints().filter((endpoint) => process.env[endpoint.keyEnvVar]?.trim())
+  return listEndpoints().filter((endpoint) => resolveProviderKey({ apiKey: endpoint.apiKey }) !== undefined)
 }
 
-export function ensureConfiguredModel(): void {
-  const configured = process.env.AGENT_MODEL?.trim()
-  if (!configured) return
-  if (findModel(configured)) return
-
-  const endpoint = listEndpoints()[0]
-  if (!endpoint) {
-    throw new ConfigError(
-      `AGENT_MODEL 指定了「${configured}」，但一个启用的端点都没有。` +
-        '先建厂商与端点（见 seedBuiltinProviders），或清掉 AGENT_MODEL。'
-    )
-  }
-  upsertModel({ id: configured, endpointId: endpoint.id, label: configured })
-  console.warn(
-    `[agent] AGENT_MODEL「${configured}」不在 models 表里，已挂到端点「${endpoint.id}」。` +
-      '要换端点就在库里改这一行。'
-  )
+/**
+ * 默认模型 id —— **库里第一个启用的模型**。
+ *
+ * ⚠️ 只有一个来源。此前还有 `AGENT_MODEL` 优先，找不到才退到第一个；
+ * 现在这条 env 线路删了（2026-10-09），因为它让「默认用哪个模型」
+ * 取决于进程环境而不是库 —— 而库里那份是用户看得见、改得动的。
+ *
+ * 拿不到返回空字符串（而不是抛）：调用点分两种，
+ * 一种要报错（启动检查），一种要null（`tryDefaultModelId`）。
+ */
+export function defaultModelId(): string {
+  // 可用优先:启动检查要的是「默认模型真的能用」,而不是「字母序第一」。
+  // 都不可用时退回全表第一个 —— 那个错误会由调用侧明确说出（缺 key / 缺端点）。
+  return usableModelList()[0]?.id ?? listModels()[0]?.id ?? ''
 }
 
 /**
  * 默认模型 id，**但拿不到就返回 null 而不是抛**。
  *
- * ⚠️ 存在的理由：删掉当前默认模型时，`defaultModelId()` 会抛
- * 「AGENT_MODEL 指向的模型不在 models 表里」。而那是**删除操作的正确后果**，
- * 不是删除操作的失败 —— 让它冒泡会把 200 变成 500，
- * 用户看到的是「删除报错」，而实际上模型已经删掉了。
+ * ⚠️ 存在的理由：删掉当前默认模型时，`defaultModelId()` 会返回空串，
+ * 而那是**删除操作的正确后果**，不是删除操作的失败 ——
+ * 让它冒泡会把 200 变成 500，用户看到的是「删除报错」，
+ * 而实际上模型已经删掉了。
  *
  * 该抛的地方仍然抛（`startServer` 启动检查要的就是那个错）。
  */
@@ -641,39 +621,25 @@ export function tryDefaultModelId(): string | null {
   }
 }
 
-export function defaultModelId(): string {
-  const configured = process.env.AGENT_MODEL?.trim()
-  if (configured) {
-    const found = findModel(configured)
-    if (found) return found.id
-    // ⚠️ **配了但库里没有 → 明确说出来**，不静默退到别的模型。
-    // 静默退化会让「我明明设了 glm-5.3 却用的是别的」变成一桩查不到的事。
-    throw new ConfigError(
-      `AGENT_MODEL 指向的模型「${configured}」不在 models 表里。` +
-        '确认 endpoints / models 表，或清掉这个变量让它用默认。'
-    )
-  }
-  return listModels()[0]?.id ?? ''
-}
-
 /**
- * 配置是否够用。启动时调。
+ * **库里没填key 的厂商** —— 启动时警告用。
  *
  * ⚠️ **只关心「至少有一个启用端点」的厂商** —— 建了 provider 但没建启用端点时，
  * 它的 key 不该让启动失败（那是在配置过程中的正常中间态）。
  *
  * ⚠️ **返回所有缺失的，不只报第一个** —— 一次看到三个比修一个再发现下一个快。
  */
-export function missingKeys(): { provider: string; envVar: string }[] {
-  const endpoints = listEndpoints() // 只含 enabled 的
-  const inUse = new Set(endpoints.map((endpoint) => endpoint.keyEnvVar))
-
-  const missing: { provider: string; envVar: string }[] = []
-  for (const provider of listProviders()) {
-    if (!inUse.has(provider.keyEnvVar)) continue
-    if (!process.env[provider.keyEnvVar]?.trim()) {
-      missing.push({ provider: provider.id, envVar: provider.keyEnvVar })
-    }
-  }
-  return missing
+export function missingKeys(): { provider: string; label: string }[] {
+  // ⚠️ **一条 SQL 判完，不走 listEndpoints()。**
+  // 那条路给的是协议层的 `EndpointConfig`，而它**故意没有 providerId**
+  // （Adapter 不需要知道端点属于哪家厂商）—— 所以在协议层的形状上
+  // 判「哪个厂商缺 key」是走不通的，硬走就得把 providerId 加回去，
+  // 而那正是当初刻意不给它的原因。这条 SQL 是绕开它的正解。
+  return all<{ id: string; label: string }>(
+    `SELECT DISTINCT p.id AS id, p.label AS label
+       FROM providers p
+       JOIN endpoints e ON e.providerId = p.id AND e.enabled = 1
+      WHERE p.apiKey IS NULL OR trim(p.apiKey) = ''
+      ORDER BY p.label`
+  ).map((row) => ({ provider: row.id, label: row.label }))
 }

@@ -1,5 +1,6 @@
 import type { DriverRegistry } from './driver.js'
 import type { ChatMessage, DriverHooks, EndpointConfig, ModelConfig } from './driver.js'
+import type { ToolDefinition } from '../tools/registry.js'
 // ⚠️ **不许 import `../drivers/index.js`。** 那会拉进 `@ai-sdk/openai`，
 // 协议层就不再是「零 SDK 依赖」了 —— 纯度检查只查直接 import，查不出这种
 // 传递依赖。具体用哪个 Driver 由调用方通过 `TurnDeps.drivers` 传进来。
@@ -63,7 +64,37 @@ export type TurnDeps = {
 }
 
 export type TurnStore = {
-  findSession(sessionId: string): { id: string; instructions: string | null; tools: string } | undefined
+  findSession(sessionId: string): {
+    id: string
+    instructions: string | null
+    tools: string
+    engine: 'little-one' | 'claude'
+    endpointId: string | null
+    modelId: string | null
+    /** claude 引擎的会话锚（claude 侧 session id）。 */
+    engineSessionId: string | null
+    /** 双审批开关（契约 §五）。true = 需要审批。 */
+    sandboxApproval: boolean
+    businessApproval: boolean
+  } | undefined
+  /**
+   * 归一化用量落账（契约 §六）。厂商归属在 store 实现里解析 ——
+   * 协议层只给 endpointId + modelId，不碰 providerId（那是配置层的事）。
+   */
+  recordUsage(input: {
+    runId: string
+    sessionId: string
+    endpointId: string
+    modelId: string
+    inputTokens: number
+    outputTokens: number
+  }): void
+  /** 实例累计用量（token）。预算闸的输入。 */
+  usageTotals(): { inputTokens: number; outputTokens: number }
+  /** 实例预算上限（token）。null = 不设防。 */
+  budgetLimit(): number | null
+  /** claude 引擎的会话锚落库（契约 §六）。 */
+  setEngineSession(sessionId: string, engineSessionId: string): void
   hasRunningRun(sessionId: string): boolean
   appendMessage(input: {
     sessionId: string
@@ -85,9 +116,9 @@ export type TurnStore = {
     durationMs?: number
     status: 'pending' | 'ok' | 'failed' | 'denied'
   }): void
-  startRun(sessionId: string): { id: string }
+  startRun(sessionId: string, options?: { id?: string; parentRunId?: string }): { id: string }
   finishRun(runId: string, result: {
-    status: 'done' | 'stopped' | 'denied' | 'failed'
+    status: 'done' | 'stopped' | 'denied' | 'cancelled' | 'failed'
     steps?: number
     usage?: unknown
     code?: string
@@ -109,6 +140,28 @@ export type ExecuteTurnInput = {
    * 那正是「前端按 code 分支却收到了没见过的事件」这类 bug 的来源。
    */
   emit: Emit
+  /**
+   * 这一轮的 run id。**给了就用作库里的 runs.id**，没给才由 startRun 生成。
+   *
+   * server 层先于开流生成它，让 `run.started`、`tool.called`、库里的 runs 行、
+   * 取消接口指向**同一个** id —— 此前是两个来源各生成各的，
+   * raven 按 runId 关联事件，对不上就是两份真相。
+   */
+  runId?: string
+  /**
+   * 取消信号。server 层在取消接口里 abort 它；**取消了就不是失败**：
+   * Driver 应返回 `status: 'cancelled'`，协议层按正常收尾处理（run.completed），
+   * 不发 `run.failed`。见契约 §三「取消一轮」。
+   */
+  signal?: AbortSignal
+  /**
+   * 已经解析好的工具定义。**协议层不解析名字** —— registry 在组装层
+   * （src/server.ts）注入，与 drivers 的注入方式同理：协议层测试不必建真注册表。
+   *
+   * 「会话里的工具在注册表里已经不存在」怎么处理是**组装层**的裁定
+   * （跳过并警告，契约 §六），协议层只管把拿到的定义原样交给 Driver。
+   */
+  tools?: ToolDefinition<never>[]
   /** 会话固定了端点/模型时用它，否则用默认。 */
   endpointId?: string
   modelId?: string
@@ -141,6 +194,23 @@ export async function executeTurn(deps: TurnDeps, input: ExecuteTurnInput): Prom
     throw new TurnError('run_in_progress', 409, '这个会话还有一轮在跑。')
   }
 
+  // 预算闸（契约 §六）。和 409 同理必须在开流前判，否则「预算用尽」会变成
+  // 流里的 run.failed —— 而它是「请求与状态冲突」，不是错误。
+  // 检查点只有 run 启动前：运行中逐 token 掐断做不到（usage 收尾才给全量），
+  // 运行中的超支由工具调用次数上限兜底。
+  const limit = deps.store.budgetLimit()
+  if (limit !== null) {
+    const used = deps.store.usageTotals()
+    if (used.inputTokens + used.outputTokens >= limit) {
+      throw new TurnError(
+        'budget_exhausted',
+        409,
+        `token 预算已用尽：累计 ${used.inputTokens + used.outputTokens} / 上限 ${limit}。` +
+          '去 raven 的配置目录调整或清除上限。',
+      )
+    }
+  }
+
   const trimmed = content.trim()
   if (trimmed === '' && input.approvalResponses.length === 0) {
     throw new TurnError('empty_content', 400, 'content 不能为空。')
@@ -151,10 +221,14 @@ export async function executeTurn(deps: TurnDeps, input: ExecuteTurnInput): Prom
   // 早先的版本写成「没指定就是没配置」，那会让「库里配好了模型、
   // 但这个会话没指定」变成 503 —— 而那是最常见的正常状态。
   // 「模型没配」的判定属于**启动期**（key 缺不缺），不��每轮。
-  const model = input.modelId
-    ? deps.store.resolveModel(input.modelId, input.endpointId)
+  // 会话固定的端点/模型（2026-10-09 落库）优先于「取默认」——
+  // claude 引擎的会话必须固定在 Anthropic 协议端点上，取默认会拿到错协议的模型。
+  const sessionModelId = input.modelId ?? session.modelId ?? undefined
+  const sessionEndpointId = input.endpointId ?? session.endpointId ?? undefined
+  const model = sessionModelId
+    ? deps.store.resolveModel(sessionModelId, sessionEndpointId)
     : (deps.store.resolveModel(undefined) ?? undefined)
-  const endpoint = (input.endpointId ? deps.store.resolveEndpoint(input.endpointId) : undefined) ??
+  const endpoint = (sessionEndpointId ? deps.store.resolveEndpoint(sessionEndpointId) : undefined) ??
     (model ? deps.store.resolveEndpoint(model.endpointId) : undefined)
 
   if (!model || !endpoint) {
@@ -164,7 +238,7 @@ export async function executeTurn(deps: TurnDeps, input: ExecuteTurnInput): Prom
       'model_not_configured',
       503,
       '没有可用的模型：models 表是空的，或指定的模型不存在。' +
-        '确认 providers / endpoints / models 三张表，或设 AGENT_MODEL。'
+        '去 raven 的「模型与厂商」界面确认 providers / endpoints / models 三张表。'
     )
   }
 
@@ -172,13 +246,25 @@ export async function executeTurn(deps: TurnDeps, input: ExecuteTurnInput): Prom
     deps.store.appendMessage({ sessionId, runId: null, role: 'user', content: trimmed })
   }
 
-  const run = deps.store.startRun(sessionId)
+  // runId 的唯一真相：server 层给的就用它（SSE 的 run.started 已经带它了），
+  // 没给（协议层直跑、验证脚本）才在这里生成。
+  const run = deps.store.startRun(sessionId, input.runId ? { id: input.runId } : {})
 
   // ⚠️ **协议层不读 risk、不判授权** —— 那是 Adapter 的活。
   // `risk` 的唯一用途在 Adapter 里（`buildApprovalConfig`）。
   // 协议层若也判一遍，就会出现两个判定来源，而它们迟早会不一致。
   try {
-    const driver = deps.drivers.get(endpoint.protocol)
+    // 引擎选择（契约 §三）：claude 引擎不走端点协议这条轴 ——
+    // 它是「换整个 loop 引擎」，声明 handles: 'claude' 的 Driver。
+    // 还没接线时这里明确拒绝（409），不让它掉进 registry 的 500。
+    if (session.engine === 'claude' && !deps.drivers.list().includes('claude')) {
+      throw new TurnError(
+        'engine_not_available',
+        409,
+        'claude 引擎尚未接线。确认沙箱里装了 claude-cli，且 drivers 注册表里有 handles 为 claude 的 Driver。',
+      )
+    }
+    const driver = deps.drivers.get(session.engine === 'claude' ? 'claude' : endpoint.protocol)
     const messages = buildModelMessages(deps.store, sessionId, input.approvalResponses)
 
     const hooks: DriverHooks = {
@@ -229,7 +315,15 @@ export async function executeTurn(deps: TurnDeps, input: ExecuteTurnInput): Prom
           ? { instructions: session.instructions ?? DEFAULT_INSTRUCTIONS }
           : {}),
         messages,
-        tools: JSON.parse(session.tools) as never,
+        tools: input.tools ?? [],
+        ...(input.signal ? { signal: input.signal } : {}),
+        ...(session.engineSessionId ? { engineSessionId: session.engineSessionId } : {}),
+        ...(input.approvalResponses.length > 0 ? { approvalResponses: input.approvalResponses } : {}),
+        // 双审批开关（契约 §五）：**始终显式传递**，不留「缺省」的二义 ——
+        // 两个开关的产品缺省不同（业务开、沙箱关），字段级缺省语义再叠一层
+        // 迟早拧包。Driver 侧只在「字段真的缺失」（老调用方）时保守取需审批。
+        ...(session.businessApproval ? { businessApproval: true } : { businessApproval: false }),
+        ...(session.sandboxApproval ? { sandboxApproval: true } : { sandboxApproval: false }),
         maxSteps: input.maxSteps ?? DEFAULT_MAX_STEPS,
         ...(input.approvalSecret ? { approvalSecret: input.approvalSecret } : {}),
       },
@@ -246,13 +340,45 @@ export async function executeTurn(deps: TurnDeps, input: ExecuteTurnInput): Prom
       })
     }
 
-    deps.store.finishRun(run.id, { status: result.status, steps: result.steps, usage: result.usage })
+    // claude 引擎的会话锚：每轮都可能变化（resume 会 fork 新 id），
+    // 以本轮结果为准覆盖落库，下轮传回。
+    if (result.engineSessionId) {
+      deps.store.setEngineSession(sessionId, result.engineSessionId)
+    }
+    // denied 提升（契约 §四）：用户拒绝了授权、Driver 返回 done —— 说明模型
+    // 接受了拒绝结论并收尾（它甚至可能没再碰那个工具，canUseTool 没机会再被调）。
+    // 这条判定是引擎无关的：little-one 的 SDK 会自己置 denied，claude 靠这里兜底。
+    const userDenied = input.approvalResponses.some((response) => !response.approved)
+    const finalStatus = userDenied && result.status === 'done' ? 'denied' : result.status
+    deps.store.finishRun(run.id, { status: finalStatus, steps: result.steps, usage: result.usage })
+    // 用量落账（契约 §六）：成功收尾的 run 都记（含 stopped/denied/cancelled ——
+    // 它们一样烧了 token）。失败路径不记：usage 半途拿不到，宁可少记。
+    deps.store.recordUsage({
+      runId: run.id,
+      sessionId,
+      endpointId: endpoint.id,
+      modelId: model.id,
+      inputTokens: result.usage.inputTokens,
+      outputTokens: result.usage.outputTokens,
+    })
 
     emit({
       name: 'run.completed',
-      data: { runId: run.id, status: result.status, steps: result.steps, usage: result.usage },
+      data: { runId: run.id, status: finalStatus, steps: result.steps, usage: result.usage },
     })
   } catch (error) {
+    // ⚠️ **取消不是失败。** abort 穿透到 Driver 之后它可能以异常收场
+    // （SDK 会把 AbortError 从流里抛出来），但契约上这是正常收尾：
+    // 发 `run.completed`（status: "cancelled"），不发 `run.failed`。
+    // raven 的终止指示器只认「恰好一个终止事件」，这里换成 failed 就是误导。
+    if (input.signal?.aborted) {
+      deps.store.finishRun(run.id, { status: 'cancelled' })
+      emit({
+        name: 'run.completed',
+        data: { runId: run.id, status: 'cancelled', steps: 0, usage: null },
+      })
+      return
+    }
     const described = describe(error)
     deps.store.finishRun(run.id, { status: 'failed', code: described.code, error: described.message })
     // ⚠️ **不自己发 `run.failed`** —— `createAgentStream` 的 catch 会发。

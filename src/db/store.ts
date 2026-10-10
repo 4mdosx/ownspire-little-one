@@ -15,6 +15,9 @@ import {
   findModel as lookupModel,
   firstModel,
 } from './registry-store.js'
+import { recordUsage, usageTotals, budgetLimit } from './usage.js'
+import { setEngineSessionId } from './sessions.js'
+import { findProviderId } from './registry-store.js'
 import type { TurnStore } from '../protocol/turn.js'
 
 /**
@@ -34,6 +37,25 @@ export const store: TurnStore = {
     return findSession(sessionId)
   },
 
+  recordUsage(input) {
+    // 厂商归属在这里解析（协议层只给 endpointId —— 那是配置层的事，
+    // EndpointConfig 刻意不带 providerId，见 protocol/driver.ts 的注释）。
+    recordUsage({
+      runId: input.runId,
+      sessionId: input.sessionId,
+      provider: findProviderId(input.endpointId),
+      model: input.modelId,
+      inputTokens: input.inputTokens,
+      outputTokens: input.outputTokens,
+    })
+  },
+
+  usageTotals,
+
+  budgetLimit,
+
+  setEngineSession: setEngineSessionId,
+
   hasRunningRun(sessionId) {
     return hasRunningRun(sessionId)
   },
@@ -50,8 +72,8 @@ export const store: TurnStore = {
 
   recordToolCall,
 
-  startRun(sessionId) {
-    return startRun(sessionId)
+  startRun(sessionId, options) {
+    return startRun(sessionId, options)
   },
 
   finishRun,
@@ -68,16 +90,15 @@ export const store: TurnStore = {
     // 这不是风格问题，是联调时真踩到的：契约的「发消息」请求体里**没有 modelId**
     // （v1 就是这样），所以每轮必然落到「没指定」这条分支。而 `firstModel()`
     // 是按 `(endpointId, label)` 排序取第一个 —— 那个顺序里排第一的是
-    // `deepseek-chat`。于是配了 `AGENT_MODEL=glm-5.3`、库里的端点也指向智谱，
-    // 请求却打到了 `api.deepseek.com`。
+    // `deepseek-chat`。而用户以为默认是 `glm-5.3`，因为启动日志打印的就是它。
     //
     // 更糟的是它**看起来是生效的**：`/api/models` 报的 default 来自
-    // `defaultModelId()`（是 glm-5.3），启动日志也打印 glm-5.3 ——
+    // `defaultModelId()`，启动日志也打印同一个值 ——
     // 只有真正跑起来的时候用一个别的模型。**两份真相，且不一致的那份只在运行时露出来。**
     //
-    // 「每轮读环境变量会掩盖配置错误」这个顾虑不成立：`AGENT_MODEL` 配错时
-    // `defaultModelId()` 会直接抛，而启动路径（server.ts）已经先调过它一次，
-    // 错误在启动时就报出来了 —— 不需要靠每轮再读一次来发现问题。
+    // ⚠️ 这里曾有一段论证说「每轮读 `AGENT_MODEL` 会掩盖配置错误」不成立。
+    // 那条 env 线路已经删了（2026-10-09），论证随之失效 ——
+    // 现在两条分支读的是同一个来源，不存在「掩盖」的可能。
     if (modelId) return lookupModel(modelId, endpointId)
     if (endpointId) return firstModel(endpointId)
     return lookupModel(defaultModelId()) ?? firstModel()

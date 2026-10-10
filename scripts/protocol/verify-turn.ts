@@ -92,6 +92,12 @@ async function testApprovalDenied(): Promise<void> {
       id: 's1',
       instructions: null,
       tools: JSON.stringify([{ name: 'removeFile', risk: 'destructive' }]),
+      engine: 'little-one',
+      endpointId: null,
+      modelId: null,
+      engineSessionId: null,
+      sandboxApproval: false,
+      businessApproval: true,
     }),
   })
   const { events, emit } = collector()
@@ -210,7 +216,7 @@ async function testProtocolMismatch(): Promise<void> {
   console.log('\n[Driver · 协议不匹配]')
   const { driver } = createFakeDriver({ script: [] })
   const { store } = createFakeStore({
-    resolveEndpoint: () => ({ id: 'x', label: 'X', protocol: 'openai-responses', keyEnvVar: 'K' }),
+    resolveEndpoint: () => ({ id: 'x', label: 'X', protocol: 'openai-responses' }),
   })
   try {
     await executeTurn({ drivers: registryOf([driver]), store }, {
@@ -350,6 +356,73 @@ function testParallelOrdering(): void {
   check('三次调用 seq 递增', log.toolCalls.map((c) => c.seq).join(',') === '1,2,3', log.toolCalls.map((c) => c.seq))
 }
 
+/** 预算闸 + 双审批开关透传 + 用量落账（契约 §五/§六，2026-10-09）。 */
+async function testBudgetAndSwitches(): Promise<void> {
+  console.log('\n[编排 · 预算闸与审批开关]')
+
+  // 预算已超 → 409 budget_exhausted，且**不开流、不建 run**
+  {
+    const { driver } = createFakeDriver({ script: [{ kind: 'text', text: 'x' }] })
+    const { store, calls } = createFakeStore({
+      budgetLimit: () => 100,
+      usageTotals: () => ({ inputTokens: 60, outputTokens: 40 }),
+    })
+    const { emit } = collector()
+    try {
+      await executeTurn({ drivers: registryOf([driver]), store }, {
+        sessionId: 's1', content: 'x', approvalResponses: [], emit,
+      })
+      check('预算超限要抛错', false, '没有抛')
+    } catch (error) {
+      const turnError = error as TurnError
+      check('预算超限 → 409 budget_exhausted', turnError.code === 'budget_exhausted' && turnError.status === 409, turnError)
+      check('预算闸挡在 run 创建之前（不落 run）', !calls.includes('startRun'), calls)
+    }
+  }
+
+  // 开关透传：businessApproval=false → Driver 收到 false；sandboxApproval=true → 收到 true
+  {
+    const { driver, log } = createFakeDriver({ script: [{ kind: 'text', text: '好了。' }] })
+    const { store } = createFakeStore({
+      findSession: () => ({
+        id: 's1', instructions: null,
+        tools: JSON.stringify([{ name: 'echo', risk: 'read' }]),
+        engine: 'little-one', endpointId: null, modelId: null, engineSessionId: null,
+        sandboxApproval: true, businessApproval: false,
+      }),
+    })
+    const { emit } = collector()
+    await executeTurn({ drivers: registryOf([driver]), store }, {
+      sessionId: 's1', content: 'x', approvalResponses: [], emit,
+    })
+    check('businessApproval=false 透传给 Driver', log.requests[0]?.businessApproval === false, log.requests[0]?.businessApproval)
+    check('sandboxApproval=true 透传给 Driver', log.requests[0]?.sandboxApproval === true, log.requests[0]?.sandboxApproval)
+  }
+
+  // 缺省开关显式化：默认会话 → businessApproval true / sandboxApproval false（都显式）
+  {
+    const { driver, log } = createFakeDriver({ script: [{ kind: 'text', text: '好了。' }] })
+    const { store } = createFakeStore()
+    const { emit } = collector()
+    await executeTurn({ drivers: registryOf([driver]), store }, {
+      sessionId: 's1', content: 'x', approvalResponses: [], emit,
+    })
+    check('默认会话显式传 businessApproval=true', log.requests[0]?.businessApproval === true, log.requests[0]?.businessApproval)
+    check('默认会话显式传 sandboxApproval=false', log.requests[0]?.sandboxApproval === false, log.requests[0]?.sandboxApproval)
+  }
+
+  // 成功收尾落账
+  {
+    const { driver } = createFakeDriver({ script: [{ kind: 'text', text: '好了。' }] })
+    const { store, calls } = createFakeStore()
+    const { emit } = collector()
+    await executeTurn({ drivers: registryOf([driver]), store }, {
+      sessionId: 's1', content: 'x', approvalResponses: [], emit,
+    })
+    check('成功收尾调用 recordUsage', calls.includes('recordUsage'), calls)
+  }
+}
+
 async function main(): Promise<void> {
   console.log('\n════ 测试组 A · 协议层（不依赖任何 SDK）════')
 
@@ -359,6 +432,7 @@ async function main(): Promise<void> {
   await testProtocolMismatch()
   testContextRebuild()
   await testParallelOrdering()
+  await testBudgetAndSwitches()
 
   console.log(`\n${assertions - failures}/${assertions} 条断言通过。`)
   console.log('\n这些断言与用哪家 SDK 无关 —— 换 Adapter 时这个文件不用改。\n')

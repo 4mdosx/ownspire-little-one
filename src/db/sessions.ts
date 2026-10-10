@@ -18,18 +18,32 @@ export type SessionRow = {
   tools: string
   createdAt: number
   updatedAt: number
+  engine: 'little-one' | 'claude'
+  /** claude 引擎的会话锚：claude 侧 session id（resume 靠它）。无写入方时为 null。 */
+  engineSessionId: string | null
+  /** 会话固定的端点/模型。null = 用默认（claude 引擎建议固定，见契约 §三）。 */
+  endpointId: string | null
+  modelId: string | null
+  /** 双审批开关（契约 §五）。true = 需要审批。 */
+  sandboxApproval: boolean
+  businessApproval: boolean
 }
 
 export type RunRow = {
   id: string
   sessionId: string
-  status: 'running' | 'done' | 'stopped' | 'denied' | 'failed' | 'interrupted'
+  status: 'running' | 'done' | 'stopped' | 'denied' | 'cancelled' | 'failed' | 'interrupted'
   startedAt: number
   endedAt: number | null
   steps: number | null
   usage: string | null
   code: string | null
   error: string | null
+  /**
+   * 预留（2026-10-09，暂无写入方）：这一轮是从哪一轮续出来的。
+   * 见 SCHEMA_SQL 里 runs 表的注释。
+   */
+  parentRunId: string | null
 }
 
 export type MessageRow = {
@@ -45,11 +59,22 @@ export function createSession(input: {
   title: string
   instructions?: string
   tools: string[]
+  engine?: 'little-one' | 'claude'
+  endpointId?: string
+  modelId?: string
+  /** 默认 false：沙箱内工具自动通过（脱手定位，契约 §五）。 */
+  sandboxApproval?: boolean
+  /** 默认 true：业务工具需要审批（治理核心，契约 §五）。 */
+  businessApproval?: boolean
 }): SessionRow {
   const timestamp = now()
   const sessionId = id('ses')
   run(
-    'INSERT INTO sessions (id, title, instructions, tools, createdAt, updatedAt) VALUES (:id, :title, :instructions, :tools, :createdAt, :updatedAt)',
+    `INSERT INTO sessions (id, title, instructions, tools, createdAt, updatedAt,
+                           engine, engineSessionId, endpointId, modelId,
+                           sandboxApproval, businessApproval)
+     VALUES (:id, :title, :instructions, :tools, :createdAt, :updatedAt,
+             :engine, NULL, :endpointId, :modelId, :sandboxApproval, :businessApproval)`,
     {
       id: sessionId,
       title: input.title,
@@ -57,23 +82,59 @@ export function createSession(input: {
       tools: JSON.stringify(input.tools),
       createdAt: timestamp,
       updatedAt: timestamp,
+      engine: input.engine ?? 'little-one',
+      endpointId: input.endpointId ?? null,
+      modelId: input.modelId ?? null,
+      sandboxApproval: (input.sandboxApproval ?? false) ? 1 : 0,
+      businessApproval: (input.businessApproval ?? true) ? 1 : 0,
     },
   )
   return findSession(sessionId)!
 }
 
 export function findSession(sessionId: string): SessionRow | undefined {
-  return get<SessionRow>('SELECT * FROM sessions WHERE id = :id', { id: sessionId })
+  const row = get<RawSessionRow>('SELECT * FROM sessions WHERE id = :id', { id: sessionId })
+  return row ? toSession(row) : undefined
 }
 
-export function listSessions(): (SessionRow & { runCount: number; messageCount: number })[] {
-  return all<SessionRow & { runCount: number; messageCount: number }>(
+/**
+ * ⚠️ SQLite 的 INTEGER 出来是 0/1，而 SessionRow 声明 boolean ——
+ * 不转的话 `flags.businessApproval === false` 这类严格判断会静默失灵
+ * （0 !== false）。转换只在这一处做，与 registry-store 的 toModel 同一套路。
+ */
+type RawSessionRow = Omit<SessionRow, 'sandboxApproval' | 'businessApproval'> & {
+  sandboxApproval: number
+  businessApproval: number
+}
+
+function toSession(row: RawSessionRow): SessionRow {
+  return {
+    ...row,
+    sandboxApproval: row.sandboxApproval === 1,
+    businessApproval: row.businessApproval === 1,
+  }
+}
+
+export function listSessions(): (SessionRow & {
+  runCount: number
+  messageCount: number
+  /** 在途 run（契约 §三 加法）：列表页的「进行中」徽标不用再逐会话查。 */
+  runningRunId: string | null
+})[] {
+  return all<RawSessionRow & { runCount: number; messageCount: number; runningRunId: string | null }>(
     `SELECT s.*,
             (SELECT COUNT(*) FROM runs r WHERE r.sessionId = s.id) AS runCount,
-            (SELECT COUNT(*) FROM messages m WHERE m.sessionId = s.id) AS messageCount
+            (SELECT COUNT(*) FROM messages m WHERE m.sessionId = s.id) AS messageCount,
+            (SELECT r.id FROM runs r WHERE r.sessionId = s.id AND r.status = 'running'
+              ORDER BY r.startedAt DESC LIMIT 1) AS runningRunId
        FROM sessions s
       ORDER BY s.updatedAt DESC`,
-  )
+  ).map((row) => ({
+    ...toSession(row),
+    runCount: row.runCount,
+    messageCount: row.messageCount,
+    runningRunId: row.runningRunId,
+  }))
 }
 
 /** 删除返回计数：**raven 的删除纪律要求回执**，别让一次误点变成没有回执的抹除。 */
@@ -94,6 +155,30 @@ export function deleteSession(sessionId: string): { messages: number; runs: numb
 
 export function touchSession(sessionId: string): void {
   run('UPDATE sessions SET updatedAt = :now WHERE id = :id', { now: now(), id: sessionId })
+}
+
+/**
+ * claude 引擎的会话锚落库（契约 §六）：Driver 每轮返回 claude 侧的
+ * session id，下轮 resume 靠它。只增改，不删 —— 删会话时随行删除。
+ */
+export function setEngineSessionId(sessionId: string, engineSessionId: string): void {
+  run('UPDATE sessions SET engineSessionId = :anchor, updatedAt = :now WHERE id = :id', {
+    anchor: engineSessionId,
+    now: now(),
+    id: sessionId,
+  })
+}
+
+/**
+ * 会话当前在途的 run id。契约 §三：会话详情带 `runningRunId`（加法），
+ * 断线重连的页面靠它决定「显示进行中」还是「刷新历史」。
+ */
+export function runningRunId(sessionId: string): string | null {
+  const row = get<{ id: string }>(
+    "SELECT id FROM runs WHERE sessionId = :id AND status = 'running' ORDER BY startedAt DESC LIMIT 1",
+    { id: sessionId },
+  )
+  return row?.id ?? null
 }
 
 export function appendMessage(input: {
@@ -122,14 +207,29 @@ export function recentMessages(sessionId: string, limit = 40): MessageRow[] {
   ).reverse()
 }
 
-export function startRun(sessionId: string): RunRow {
-  const runId = id('run')
-  run('INSERT INTO runs (id, sessionId, status, startedAt) VALUES (:id, :sessionId, :status, :startedAt)', {
-    id: runId,
-    sessionId,
-    status: 'running',
-    startedAt: now(),
-  })
+export function startRun(
+  sessionId: string,
+  /**
+   * 外部传入的 run id。**给了就用它，没给才生成。**
+   *
+   * 为什么让 server 层能把 SSE 的 `run.started.runId` 和库里的 `runs.id` 统一成
+   * 一个：此前是两边各生成各的，同一条流里 `run.started` 的 runId 与
+   * `tool.called` 的 runId 对不上 —— raven 按 runId 关联事件，这就是两份真相。
+   * 取消接口（POST …/cancel）按 runId 找在跑的轮次，更是必须只有一个 id。
+   */
+  options?: { id?: string; parentRunId?: string },
+): RunRow {
+  const runId = options?.id ?? id('run')
+  run(
+    'INSERT INTO runs (id, sessionId, status, startedAt, parentRunId) VALUES (:id, :sessionId, :status, :startedAt, :parentRunId)',
+    {
+      id: runId,
+      sessionId,
+      status: 'running',
+      startedAt: now(),
+      parentRunId: options?.parentRunId ?? null,
+    },
+  )
   return findRun(runId)!
 }
 
@@ -138,7 +238,7 @@ export function findRun(runId: string): RunRow | undefined {
 }
 
 export function finishRun(runId: string, result: {
-  status: 'done' | 'stopped' | 'denied' | 'failed'
+  status: 'done' | 'stopped' | 'denied' | 'cancelled' | 'failed'
   steps?: number
   usage?: unknown
   code?: string

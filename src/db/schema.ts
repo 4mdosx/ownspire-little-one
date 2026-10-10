@@ -37,6 +37,30 @@ export const LEGACY_INDEXES: Record<string, string> = {
 }
 
 /**
+ * **已删除、但旧库里还在的列。** 启动时自动 `DROP COLUMN`，失败则拒绝启动。
+ *
+ * ⚠️ **与 `MIGRATABLE_COLUMNS` 的方向相反**：那边是加列（`ADD COLUMN` 纯加法），
+ * 这边是删列。直觉上删列更危险，所以第一版这里写的是「拒绝启动，请删库重建」。
+ *
+ * 实测推翻了那个判断（2026-10-09，在真有数据的库上验过）：
+ * SQLite 3.35+ 的 `ALTER TABLE ... DROP COLUMN` 在这张表上**不重建表、不丢数据** ——
+ * 3 个端点、3 个会话、`foreign_key_check` 空、`integrity_check` 全过。
+ * 所以「删列一定要搬数据、搬错了是静默损坏」这个顾虑在**本例**里不成立，
+ * 让用户删库重建 3 个会话才是真实的代价。
+ *
+ * ⚠️ 但**不**无条件自动：`DROP COLUMN` 在该列被索引或外键引用时会失败。
+ * 那种情况不重试、不绕过 —— 直接抛出去让人看一眼，因为那说明有本文件
+ * 不知道的依赖，而「绕过它」正是静默损坏的起点。
+ */
+export const DROPPABLE_COLUMNS: Array<{ table: string; column: string; reason: string }> = [
+  {
+    table: 'providers',
+    column: 'keyEnvVar',
+    reason: 'key 已明文入库（apiKey），环境变量不再是配置来源，所以「key 的环境变量名」失去了唯一用途。',
+  },
+]
+
+/**
  * **可以自动迁移**的列缺失。
  *
  * ⚠️ 为什么这跟 `LEGACY_TABLES` 分成两档：
@@ -60,17 +84,120 @@ export const MIGRATABLE_COLUMNS: Array<{ table: string; column: string; ddl: str
     ddl: 'ALTER TABLE providers ADD COLUMN apiKey TEXT',
     reason: 'key 入库（2026-10-09 裁定）。缺这一列时所有读 key 的地方都会拿到 undefined。',
   },
+  {
+    table: 'runs',
+    column: 'parentRunId',
+    ddl: 'ALTER TABLE runs ADD COLUMN parentRunId TEXT',
+    reason: '预留列（2026-10-09）：run 的血缘。当前无写入方，先让旧库补上这一列。',
+  },
+  {
+    table: 'sessions',
+    column: 'engine',
+    ddl: "ALTER TABLE sessions ADD COLUMN engine TEXT NOT NULL DEFAULT 'little-one'",
+    reason: '多引擎（2026-10-09）：little-one / claude。缺省即 little-one，旧行语义不变。',
+  },
+  {
+    table: 'sessions',
+    column: 'engineSessionId',
+    ddl: 'ALTER TABLE sessions ADD COLUMN engineSessionId TEXT',
+    reason: 'claude 引擎的会话锚（2026-10-09）。当前无写入方，先补列。',
+  },
+  {
+    table: 'sessions',
+    column: 'endpointId',
+    ddl: 'ALTER TABLE sessions ADD COLUMN endpointId TEXT',
+    reason: '会话固定端点（2026-10-09）。此前类型上有这个概念但没有落库。',
+  },
+  {
+    table: 'sessions',
+    column: 'modelId',
+    ddl: 'ALTER TABLE sessions ADD COLUMN modelId TEXT',
+    reason: '会话固定模型（2026-10-09）。同上。',
+  },
+  {
+    table: 'sessions',
+    column: 'sandboxApproval',
+    ddl: 'ALTER TABLE sessions ADD COLUMN sandboxApproval INTEGER NOT NULL DEFAULT 0',
+    reason: '双审批开关（2026-10-09，契约 §五）：沙箱内工具，默认自动通过。',
+  },
+  {
+    table: 'sessions',
+    column: 'businessApproval',
+    ddl: 'ALTER TABLE sessions ADD COLUMN businessApproval INTEGER NOT NULL DEFAULT 1',
+    reason: '双审批开关（2026-10-09，契约 §五）：业务工具，默认需要审批。',
+  },
 ]
 
+/**
+ * 持久化结构的版本号。**这不是对外契约**（对外契约只有 docs/01-contract.md），
+ * 但受内部演进政策约束（契约 §一「持久化演进政策」一节）：
+ *
+ * - 老库必须永远能被新代码打开 —— 线上会有跨版本 resume。
+ * - 只增不删：加表、加列直接做（配合 MIGRATABLE_COLUMNS）；改列名/改类型/删列
+ *   必须在这里升版本号，并写迁移步骤。
+ * - `_meta.schemaVersion` 记的是「这行数据是哪个结构写出来的」，让下一次
+ *   改结构的人有地方下钉子，而不是靠 git log 考古。
+ */
+export const SCHEMA_VERSION = 1
+
 export const SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS _meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sessions (
   id           TEXT PRIMARY KEY,
   title        TEXT NOT NULL,
   instructions TEXT,
   tools        TEXT NOT NULL,
   createdAt    INTEGER NOT NULL,
-  updatedAt    INTEGER NOT NULL
+  updatedAt    INTEGER NOT NULL,
+  -- 引擎（2026-10-09）。'little-one' 自研 loop / 'claude' 委托 claude-cli。
+  -- 老库迁移见 MIGRATABLE_COLUMNS；缺省即 little-one。
+  engine       TEXT NOT NULL DEFAULT 'little-one',
+  -- claude 引擎的会话锚：claude 侧 session id，resume 靠它。
+  engineSessionId TEXT,
+  -- 会话固定端点/模型时存这里（claude 引擎必须固定，GLM 端点 vs 真 Claude 端点）。
+  endpointId   TEXT,
+  modelId      TEXT,
+  -- 双审批开关（2026-10-09，契约 §五）。1 = 需要审批。
+  -- 沙箱内工具默认 0（自动通过，脱手定位），业务工具默认 1（治理核心）。
+  sandboxApproval  INTEGER NOT NULL DEFAULT 0,
+  businessApproval INTEGER NOT NULL DEFAULT 1
 );
+
+-- 事件日志（2026-10-09）。**事件流从此是事实源**：断线重连靠它回放，
+-- 审计靠它留痕。一次 run 的事件在流关闭后仍然可读。
+-- seq 是 run 内单调递增，SSE 的 id: 行带它，重连用 after=seq 续传。
+CREATE TABLE IF NOT EXISTS events (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  runId     TEXT NOT NULL,
+  sessionId TEXT NOT NULL,
+  seq       INTEGER NOT NULL,
+  name      TEXT NOT NULL,
+  data      TEXT NOT NULL,
+  createdAt INTEGER NOT NULL,
+  UNIQUE (runId, seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_events_run ON events(runId, seq);
+
+-- token 账本（2026-10-09，契约 §六）。**全程不出现钱** —— 定价随厂商与时间变，
+-- 而 token 数是厂商无关的记账单位。一行 = 一次 run 的用量，按厂商/模型可分组。
+CREATE TABLE IF NOT EXISTS usageLedger (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  runId        TEXT NOT NULL,
+  sessionId    TEXT NOT NULL,
+  provider     TEXT NOT NULL,
+  model        TEXT NOT NULL,
+  inputTokens  INTEGER NOT NULL,
+  outputTokens INTEGER NOT NULL,
+  createdAt    INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ledger_model ON usageLedger(provider, model);
+CREATE INDEX IF NOT EXISTS idx_ledger_session ON usageLedger(sessionId);
 
 CREATE TABLE IF NOT EXISTS runs (
   id         TEXT PRIMARY KEY,
@@ -81,7 +208,11 @@ CREATE TABLE IF NOT EXISTS runs (
   steps      INTEGER,
   usage      TEXT,
   code       TEXT,
-  error      TEXT
+  error      TEXT,
+  -- 预留（2026-10-09，暂无写入方）：这一轮是从哪一轮续出来的。
+  -- OpenHands 的 Event.parent_id 从第一天就存在，后来对话树、分支、恢复全靠它。
+  -- 现在加一列是零成本；等想要「从哪断的」时再补，就只能靠时间戳猜。
+  parentRunId TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(sessionId, startedAt DESC);
@@ -146,9 +277,10 @@ CREATE INDEX IF NOT EXISTS idx_toolCalls_session ON toolCalls(sessionId, id);
 --    代价明说：**key 会出现在数据库备份里**。换来的补偿是所有出站接口
 --    永不回显它 —— 那才是泄漏面，而不是存储本身。
 --
--- ⚠️ keyEnvVar 从「key 的唯一来源」降级为**兜底**：取值优先级是
---    apiKey 优先，没有才看环境变量。所以容器里用 env 注入的既有方式
---    仍然有效，界面填的只是覆盖它。
+-- ⚠️ **key 只有这一个来源**（2026-10-09 再裁定）：环境变量不再参与。
+--    此前还有一列 keyEnvVar 做兜底，值取自process.env —— 现在删了。
+--    理由是「两处来源、一处生效」的模型里，用户改错地方却看到「已保存」，
+--    而那比不提供界面更糟。现在改 key 只有一个地方可改：这里。
 --
 -- ⚠️ **注释里绝对不能出现反引号** —— 这整个文件是一个模板字符串，
 -- 一个反引号就会提前结束它，而症状是「TS 报某个远行的语法错」，
@@ -156,8 +288,6 @@ CREATE INDEX IF NOT EXISTS idx_toolCalls_session ON toolCalls(sessionId, id);
 CREATE TABLE IF NOT EXISTS providers (
   id              TEXT PRIMARY KEY,
   label           TEXT NOT NULL,
-  -- key 所在的环境变量名。**有apiKey 时它只是兜底**，不是唯一来源。
-  keyEnvVar        TEXT NOT NULL,
   -- 界面填入的 key。明文，**永不出现在任何响应里**。
   apiKey           TEXT,
   -- 这个厂商端点的**默认**协议。单端点可在 endpoints.protocol 里覆盖。
