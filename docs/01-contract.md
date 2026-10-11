@@ -243,6 +243,7 @@ GET /api/config         → 见下面「配置目录」
 ```
 GET    /api/config                          → 一次返回三段 + 当前默认模型
 PUT    /api/config/providers/:id           → 增改厂商（apiKey 可选，不传 = 不改）
+POST   /api/config/providers/:id/probe    → 用该厂商的 key 发一条最短对话（不落库、响应不含 key）
 PUT    /api/config/endpoints/:id           → 增改端点
 PUT    /api/config/models                  → 增改模型（body 里带 endpointId）
 DELETE /api/config/providers/:id[?cascade=1]

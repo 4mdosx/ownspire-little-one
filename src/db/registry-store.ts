@@ -9,7 +9,8 @@ import { now } from '../lib/ids.js'
  *
  * **key 属于厂商**（同一家的多个端点共用一个 key），
  * **协议挂在端点上**（同一家的不同端点协议可能不同：
- * 智谱的 `/api/paas/v4` 是 OpenAI Chat，而 `/api/anthropic` 是 Anthropic Messages）。
+ * 智谱编码套餐的 OpenAI Chat 是 `/api/coding/paas/v4`，Anthropic 是 `/api/anthropic`。
+ * `/api/paas/v4` 扣的是按量资源包，不是套餐额度）。
  *
  * 所以 Adapter 的选择依据是 `endpoint.protocol`，而 key 的来源是 `endpoint.providerId`。
  * **这两个是独立的** —— 别把它们合成一个「厂商 = Adapter」的假设。
@@ -508,8 +509,10 @@ export function deleteProvider(
  * 界面上的表现是每个厂商都显示「未配置 key」，那是对的：
  * 它说的是「确实还没配」，而不是「配在别处你看不见」。
  *
- * ⚠️ **智谱有三个端点、两种协议**，这是「Adapter 按协议切」的现实依据：
- * 同一个 key，`/api/paas/v4` 走 OpenAI Chat，`/api/anthropic` 走 Anthropic Messages。
+ * ⚠️ **智谱两个端点、两种协议**，这是「Adapter 按协议切」的现实依据。
+ * 编码套餐的 OpenAI 地址是 `/api/coding/paas/v4`，Anthropic 是 `/api/anthropic`。
+ * `/api/paas/v4` 扣按量资源包：同一把正在使用的套餐 key 打过去会得到
+ * 429 / 1113「余额不足或无可用资源包」，看起来像没钱，其实是计费通道错了。
  */
 export function seedBuiltinProviders(): void {
   upsertProvider({
@@ -537,7 +540,7 @@ export function seedBuiltinProviders(): void {
     id: 'zhipu-chat',
     providerId: 'zhipu',
     label: '智谱（OpenAI Chat）',
-    baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+    baseUrl: 'https://open.bigmodel.cn/api/coding/paas/v4',
     // ⚠️ GLM 硬要求 thinking.type=enabled，**漏了直接请求失败**。
     // reasoning_effort 不在这里设默认 —— 那由每个模型自己决定
     //（glm-5.3 默认 max，那是最贵的一档）。

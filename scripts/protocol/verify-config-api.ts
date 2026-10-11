@@ -195,6 +195,35 @@ async function main(): Promise<void> {
     })
     check('非法 reasoningEffort → 4xx（不是 500）', badModel.status >= 400 && badModel.status < 500, badModel.status)
 
+    console.log('\n[检测 · 不回显 key、不打到真厂商]')
+    const dead = await request(port, token, 'PUT', '/api/config/endpoints/probe-dead', {
+      providerId: 'zhipu',
+      label: '检测用死端点',
+      baseUrl: 'http://127.0.0.1:1/v1',
+    })
+    check('建死端点 → 200', dead.status === 200, dead.body.slice(0, 160))
+    const deadModel = await request(port, token, 'PUT', '/api/config/models', {
+      id: 'probe-model',
+      endpointId: 'probe-dead',
+      label: '检测模型',
+    })
+    check('建检测模型 → 200', deadModel.status === 200, deadModel.status)
+    const probe = await request(port, token, 'POST', '/api/config/providers/zhipu/probe', {
+      endpointId: 'probe-dead',
+    })
+    check('检测死端点 → 200（连不上也是结果，不是 500）', probe.status === 200, probe.body.slice(0, 240))
+    check('没连上', probe.json['reached'] === false, probe.json)
+    check('⚠️ 检测响应里搜不到 key 明文', !probe.body.includes(SECRET) && !probe.body.includes('"apiKey"'))
+    const sentinel = '探针密钥不要回显'
+    const nonAscii = await request(port, token, 'POST', '/api/config/providers/zhipu/probe', {
+      apiKey: sentinel,
+      endpointId: 'probe-dead',
+    })
+    check('非 ASCII key → 400', nonAscii.status === 400, nonAscii.body.slice(0, 200))
+    check('⚠️ 400 的文案里没有把 key 回显出来', !nonAscii.body.includes(sentinel))
+    const noKey = await request(port, token, 'POST', '/api/config/providers/deepseek/probe')
+    check('没配 key → 400，而且不会去连厂商', noKey.status === 400, noKey.body.slice(0, 160))
+
     console.log('\n[删 · 级联门禁]')
     const noCascade = await request(port, token, 'DELETE', '/api/config/providers/zhipu')
     check('厂商下有端点 → 409 cascade_required', noCascade.status === 409 && noCascade.json['code'] === 'cascade_required', { status: noCascade.status, body: noCascade.body.slice(0, 160) })

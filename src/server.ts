@@ -27,6 +27,7 @@ import { listEvents, saveEvent } from './db/events.js'
 import { budgetLimit, setBudgetLimit, usageByModel, usageTotals } from './db/usage.js'
 import { runningRunId } from './db/sessions.js'
 import { findModel as lookupModelById, findEndpoint as lookupEndpointById } from './db/registry-store.js'
+import { probeProvider } from './probe.js'
 import { executeTurn, TurnError, type ApprovalResponseInput } from './protocol/turn.js'
 import { drivers } from './drivers/index.js'
 import { store } from './db/store.js'
@@ -204,6 +205,21 @@ export function buildRouter(token: string): Router {
       })
     )
     sendJson(res, 200, { provider: listProviderViews().find((item) => item.id === id) })
+  })
+
+  /**
+   * 连接检测。POST 而不是 PUT：它不改目录，只发一条最短对话。
+   * 结果里没有 key。输入框里没保存的 key 可以放在 body.apiKey 里试，不会落库。
+   */
+  router.post('/api/config/providers/:id/probe', async ({ req, res, params }) => {
+    requireAuth(req, token)
+    const body = await readJson<{ apiKey?: unknown; endpointId?: unknown }>(req)
+    const result = await probeProvider({
+      providerId: requireId(params.id),
+      ...(typeof body.apiKey === 'string' ? { apiKey: body.apiKey } : {}),
+      ...(typeof body.endpointId === 'string' ? { endpointId: body.endpointId } : {}),
+    })
+    sendJson(res, 200, result)
   })
 
   router.put('/api/config/endpoints/:id', async ({ req, res, params }) => {
