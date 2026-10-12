@@ -1,4 +1,4 @@
-import { ensureMagpie } from './magpie-process.js'
+import { ensureMagpie, setMagpieExitHandler, stopMagpie } from './magpie-process.js'
 import { startServer } from './server.js'
 
 /**
@@ -18,7 +18,25 @@ process.on('uncaughtException', (error) => {
   process.exit(1)
 })
 
+setMagpieExitHandler(() => {
+  console.error('[agent] Magpie 退出了，little-one 一起退出，好让部署把它俩重新拉起来。')
+  process.exit(1)
+})
+
+function shutdown(signal: NodeJS.Signals): void {
+  console.log(`[agent] 收到 ${signal}，停下 Magpie。`)
+  void stopMagpie().finally(() => process.exit(0))
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'))
+process.on('SIGINT', () => shutdown('SIGINT'))
+
 void (async () => {
-  await ensureMagpie()
-  await startServer()
+  try {
+    await ensureMagpie()
+    await startServer()
+  } catch (error) {
+    console.error('[agent] 启动失败：', error instanceof Error ? error.message : error)
+    await stopMagpie()
+    process.exit(1)
+  }
 })()

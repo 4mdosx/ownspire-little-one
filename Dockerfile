@@ -25,6 +25,22 @@ ENV AGENT_VERSION=$AGENT_VERSION
 ENV AGENT_PORT=5900
 ENV AGENT_DB_FILE=/data/agent.db
 
+# Magpie 终端 CLI。启动时 little-one spawn `magpie serve`，配置落在 /data/magpie
+# （和 agent.db 同一块盘，重建容器还在）。桌面构建要 GTK，容器里用不了。
+# 换版本时同时改 URL 与 sha256（该 release 的 SHA256SUMS 里 magpie-cli-linux-amd64）。
+ARG MAGPIE_VERSION=v0.1.1204
+ARG MAGPIE_SHA256=de02d5a03166a0caef2b77b8246b83a0100bfd225af0e34087c55b3ff69adbe5
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates curl \
+  && curl -fsSL -o /usr/local/bin/magpie \
+    "https://github.com/yetone/magpie-releases/releases/download/${MAGPIE_VERSION}/magpie-cli-linux-amd64" \
+  && echo "${MAGPIE_SHA256}  /usr/local/bin/magpie" | sha256sum -c - \
+  && chmod 755 /usr/local/bin/magpie \
+  && apt-get purge -y curl \
+  && apt-get autoremove -y \
+  && rm -rf /var/lib/apt/lists/*
+ENV MAGPIE_STATE_DIR=/data/magpie
+
 COPY --from=build --chown=node:node /app/package.json ./package.json
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/src ./src

@@ -81,8 +81,12 @@ interface RavenClient {
 ```bash
 npm install
 cp .env.example .env            # 填 AGENT_RUNTIME_TOKEN（至少 16 字符）与 MAGPIE_MODEL
-npm run dev                     # http://127.0.0.1:5900
+npm run dev                     # http://127.0.0.1:5900，同时拉起 magpie serve
 ```
+
+本机需要 `magpie` 在 PATH 或 `~/.local/bin`（`curl -fsSL https://usemagpie.ai/install.sh | sh`）。
+部署镜像里已经带了 CLI：容器启动会跑 `magpie serve`，厂商配置写在 `/data/magpie`。
+端口上已经有 Magpie 时不会再起一个。
 
 ```bash
 npm run typecheck
@@ -102,6 +106,7 @@ src/
 ├── server.ts        路由 —— 每个 handler 对应契约的一节
 ├── config/env.ts    部署参数（库路径 / token / 端口）
 ├── upstream.ts      Magpie 地址、调用 token、MAGPIE_MODEL
+├── magpie-process.ts  启动时拉起 magpie serve，退出时停掉
 ├── agent/loop.ts    Agent Loop：SDK 的流 → 契约的八个事件
 ├── tools/
 │   ├── registry.ts  工具定义、风险、JSON Schema 导出

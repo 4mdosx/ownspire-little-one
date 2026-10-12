@@ -78,3 +78,8 @@ claude 引擎是另一条 loop：它把 Anthropic 环境变量指到 Magpie 的 
 ## 六、启动条件
 
 `MAGPIE_MODEL` 没设就拒绝启动。厂商 key 和协议不在这个进程里检查。
+
+进程起来时拉起 `magpie serve`（`src/magpie-process.ts`）。端口上已经有 Magpie
+就不再起第二个。二进制找不到、或十几秒内没在听，启动失败。
+`MAGPIE_AUTOSTART=0` 表示 Magpie 由别的进程管。部署镜像自带 CLI，
+配置写在 `MAGPIE_STATE_DIR`（`/data/magpie`）。收到 SIGTERM 时先停掉这次拉起的 Magpie。
