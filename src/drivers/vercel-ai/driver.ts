@@ -8,6 +8,7 @@ import {
   type ToolSet,
 } from 'ai'
 import type { AgentDriver, ChatMessage, DriverHooks, DriverRequest, DriverResult } from '../../protocol/driver.js'
+import { magpieApiKey, magpieChatBaseUrl } from '../../upstream.js'
 import {
   classifyModelError,
   type ModelError,
@@ -22,10 +23,11 @@ import type { Risk } from '../../tools/registry.js'
  * **这是唯一 import `ai` / `@ai-sdk/*` 的地方之一**（另一个是 registry 本身）。
  * 协议层永远见不到它们。
  *
- * ## 覆盖哪些端点
+ * ## 只说一套线协议
  *
- * 全部 OpenAI Chat Completions 协议的厂商共用这一个 adapter：
- * GLM / DeepSeek / Kimi / OpenAI 官方 —— 差别只是 baseURL 与扩展参数。
+ * 出站永远是 Magpie 的 OpenAI Chat Completions（`provider.chat()`）。
+ * Responses / Messages / Gemini 的互译、厂商 thinking 字段，都在 Magpie。
+ * 这次请求只带 `modelId`，不带厂商地址、key 或推理档位。
  *
  * ## ⚠️ 版本锁定
  *
@@ -45,9 +47,6 @@ import type { Risk } from '../../tools/registry.js'
  * 所以写在这里而不是散进协议层：
  * **换 SDK 时要改的地方，应该恰好是这一整个文件。**
  */
-
-/** GLM 系列模型 id 的判定前缀。⚠️ 按模型判，不按 baseURL —— 同一端点上可能有多家模型。 */
-const GLM_MODEL_PREFIX = /^glm-/i
 
 /**
  * 「怎么把 (endpoint, model) 变成一个 LanguageModel」。
@@ -130,7 +129,6 @@ export function createVercelAiDriver(createModel: ModelFactory = defaultModelFac
 
     const result = await agent.stream({
       messages: toSdkMessages(request.messages.filter((message) => message.role !== 'system')) as ModelMessage[],
-      ...providerOptionsFor(request),
       // ⚠️ 取消必须穿透到 SDK：abort 之后流会结束、在飞的工具调用会被中断。
       // 只在会话层记一个「已取消」而模型请求继续烧 token，那是假取消。
       ...(request.signal ? { abortSignal: request.signal } : {}),
@@ -365,38 +363,6 @@ function toSdkMessages(messages: ChatMessage[]): unknown[] {
 }
 
 /**
- * 厂商扩展参数。**走 `providerOptions`，不塞进 Prompt** ——
- * Prompt 里写它们等于没写。
- *
- * ⚠️ 键是 **provider 名**（`openai`，因为用的是 `@ai-sdk/openai`），
- * 不是模型名也不是端点名。
- */
-function providerOptionsFor(request: DriverRequest): { providerOptions?: Record<string, Record<string, unknown>> } {
-  const extra = request.endpoint.extraBody
-  const isGlm = GLM_MODEL_PREFIX.test(request.model.id)
-
-  /**
-   * **两档来源，后者盖前者（优先级从低到高）：**
-   *
-   * 1. **模型 id 判出的安全网**：GLM 硬要求 `thinking.type=enabled`
-   *    （用 `disabled` 直接请求失败），所以即使没人配也要带。
-   *    这一步按**模型 id** 判，不按 baseURL —— 同一端点上可能挂多家模型，
-   *    按 baseURL 会把参数发给不支持它的厂商，那是 400。
-   * 2. **端点的 `extraBody`（库里配的）**：它是权威来源，覆盖上面的默认。
-   *    理由：加一家新厂商应该只改数据库，不该改这个文件。
-   *
-   * `reasoning_effort` 只有显式配了才带 —— 省掉就是用厂商默认值，
-   * 而 GLM 的默认是 `max`（最贵的一档）。
-   */
-  const body: Record<string, unknown> = {}
-  if (isGlm) body.thinking = { type: 'enabled' }
-  if (request.model.reasoningEffort) body.reasoning_effort = request.model.reasoningEffort
-  Object.assign(body, extra ?? {})
-
-  return Object.keys(body).length > 0 ? { providerOptions: { openai: body } } : {}
-}
-
-/**
  * ⚠️ **必须显式用 `provider.chat()`，不能用 `provider(modelId)`。**
  *
  * `provider(modelId)` 走**默认路由**：它按模型名猜该用哪个 OpenAI API
@@ -411,18 +377,15 @@ function providerOptionsFor(request: DriverRequest): { providerOptions?: Record<
  *
  * 而且即使不崩，猜错API 也是错的（GLM 的 `/api/paas/v4` 只有 Chat Completions）。
  *
- * 所以：**协议族叫 `openai-chat-completions`，就该用 `chat()`，名字与实现对齐。**
+ * 所以：**出站协议是 Chat Completions，就用 `chat()`。**
+ * 地址和 key 来自 Magpie，不读端点上的厂商 baseUrl / apiKey。
  */
 function defaultModelFactory(request: DriverRequest): LanguageModel {
   const provider = createOpenAI({
-    ...(request.endpoint.baseUrl ? { baseURL: request.endpoint.baseUrl } : {}),
-    // ⚠️ key 已经在 db 层解析好了（库里填的优先，环境变量兜底）。
-    // 两处都没有时是 undefined —— **让它原样传给 SDK**，
-    // 那条错误信息会指出这个厂商没配 key，而我们自己编的话
-    // 只能说出变量名，说不出「也可以在管理界面里填」。
-    apiKey: request.endpoint.apiKey,
+    baseURL: magpieChatBaseUrl(),
+    apiKey: magpieApiKey(),
   })
-  return provider.chat(request.model.id)
+  return provider.chat(request.modelId)
 }
 
 /**

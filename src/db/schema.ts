@@ -54,9 +54,14 @@ export const LEGACY_INDEXES: Record<string, string> = {
  */
 export const DROPPABLE_COLUMNS: Array<{ table: string; column: string; reason: string }> = [
   {
-    table: 'providers',
-    column: 'keyEnvVar',
-    reason: 'key 已明文入库（apiKey），环境变量不再是配置来源，所以「key 的环境变量名」失去了唯一用途。',
+    table: 'sessions',
+    column: 'endpointId',
+    reason: '会话不再固定端点。出站地址是 Magpie，不在会话上。',
+  },
+  {
+    table: 'sessions',
+    column: 'modelId',
+    reason: '会话不再选择模型。模型名是部署参数 MAGPIE_MODEL。',
   },
 ]
 
@@ -79,12 +84,6 @@ export const DROPPABLE_COLUMNS: Array<{ table: string; column: string; reason: s
  */
 export const MIGRATABLE_COLUMNS: Array<{ table: string; column: string; ddl: string; reason: string }> = [
   {
-    table: 'providers',
-    column: 'apiKey',
-    ddl: 'ALTER TABLE providers ADD COLUMN apiKey TEXT',
-    reason: 'key 入库（2026-10-09 裁定）。缺这一列时所有读 key 的地方都会拿到 undefined。',
-  },
-  {
     table: 'runs',
     column: 'parentRunId',
     ddl: 'ALTER TABLE runs ADD COLUMN parentRunId TEXT',
@@ -101,18 +100,6 @@ export const MIGRATABLE_COLUMNS: Array<{ table: string; column: string; ddl: str
     column: 'engineSessionId',
     ddl: 'ALTER TABLE sessions ADD COLUMN engineSessionId TEXT',
     reason: 'claude 引擎的会话锚（2026-10-09）。当前无写入方，先补列。',
-  },
-  {
-    table: 'sessions',
-    column: 'endpointId',
-    ddl: 'ALTER TABLE sessions ADD COLUMN endpointId TEXT',
-    reason: '会话固定端点（2026-10-09）。此前类型上有这个概念但没有落库。',
-  },
-  {
-    table: 'sessions',
-    column: 'modelId',
-    ddl: 'ALTER TABLE sessions ADD COLUMN modelId TEXT',
-    reason: '会话固定模型（2026-10-09）。同上。',
   },
   {
     table: 'sessions',
@@ -138,7 +125,26 @@ export const MIGRATABLE_COLUMNS: Array<{ table: string; column: string; ddl: str
  * - `_meta.schemaVersion` 记的是「这行数据是哪个结构写出来的」，让下一次
  *   改结构的人有地方下钉子，而不是靠 git log 考古。
  */
-export const SCHEMA_VERSION = 1
+export const SCHEMA_VERSION = 2
+
+/**
+ * 已经不再使用的表。启动时 `DROP TABLE`。
+ * 顺序：先子表。SQLite 默认不强制外键，但按依赖倒序删，迁移日志也好读。
+ */
+export const DROPPABLE_TABLES: Array<{ table: string; reason: string }> = [
+  {
+    table: 'models',
+    reason: '模型选择交给 Magpie。little-one 不再保存模型清单。',
+  },
+  {
+    table: 'endpoints',
+    reason: '协议与厂商地址交给 Magpie。little-one 只说一套 Chat Completions。',
+  },
+  {
+    table: 'providers',
+    reason: '厂商 key 交给 Magpie。little-one 的库里不再存 key。',
+  },
+]
 
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS _meta (
@@ -158,9 +164,6 @@ CREATE TABLE IF NOT EXISTS sessions (
   engine       TEXT NOT NULL DEFAULT 'little-one',
   -- claude 引擎的会话锚：claude 侧 session id，resume 靠它。
   engineSessionId TEXT,
-  -- 会话固定端点/模型时存这里（claude 引擎必须固定，GLM 端点 vs 真 Claude 端点）。
-  endpointId   TEXT,
-  modelId      TEXT,
   -- 双审批开关（2026-10-09，契约 §五）。1 = 需要审批。
   -- 沙箱内工具默认 0（自动通过，脱手定位），业务工具默认 1（治理核心）。
   sandboxApproval  INTEGER NOT NULL DEFAULT 0,
@@ -261,80 +264,4 @@ CREATE TABLE IF NOT EXISTS toolCalls (
 );
 
 CREATE INDEX IF NOT EXISTS idx_toolCalls_session ON toolCalls(sessionId, id);
-
--- ---------------------------------------------------------------------------
--- 模型端点与模型清单
--- ---------------------------------------------------------------------------
---
--- ⚠️ **这里存的是「怎么连」，不是「连什么」。**
--- 具体某个会话用了哪个模型，记在 sessions 上。
--- 这几张表是**全局目录**：有哪些厂商、有哪些端点、有哪些模型可选。
-
--- 一个厂商。**key 属于厂商，不属于端点，也不属于协议。**
---
--- ⚠️ **apiKey 是明文存的**（2026-10-09 裁定，与早先「key 永不进库」的纪律相反）。
---    理由是管理界面要能直接填 key，而那要求它有个落盘的地方。
---    代价明说：**key 会出现在数据库备份里**。换来的补偿是所有出站接口
---    永不回显它 —— 那才是泄漏面，而不是存储本身。
---
--- ⚠️ **key 只有这一个来源**（2026-10-09 再裁定）：环境变量不再参与。
---    此前还有一列 keyEnvVar 做兜底，值取自process.env —— 现在删了。
---    理由是「两处来源、一处生效」的模型里，用户改错地方却看到「已保存」，
---    而那比不提供界面更糟。现在改 key 只有一个地方可改：这里。
---
--- ⚠️ **注释里绝对不能出现反引号** —— 这整个文件是一个模板字符串，
--- 一个反引号就会提前结束它，而症状是「TS 报某个远行的语法错」，
--- 指向的位置和真正的原因差了十几行。
-CREATE TABLE IF NOT EXISTS providers (
-  id              TEXT PRIMARY KEY,
-  label           TEXT NOT NULL,
-  -- 界面填入的 key。明文，**永不出现在任何响应里**。
-  apiKey           TEXT,
-  -- 这个厂商端点的**默认**协议。单端点可在 endpoints.protocol 里覆盖。
-  defaultProtocol TEXT NOT NULL,
-  createdAt       INTEGER NOT NULL,
-  updatedAt       INTEGER NOT NULL
-);
-
--- 一个端点。属于某个厂商，走某种协议。
---
--- ⚠️ protocol 在这里而不只在 provider 上，因为**同一厂商的不同端点
--- 协议可能不同**：智谱的 /api/paas/v4 是 OpenAI Chat Completions，
--- 而 /api/anthropic 是 Anthropic Messages。留空则继承厂商默认。
---
--- ⚠️ **SQL 注释里不许出现反引号** —— SCHEMA_SQL 是模板字符串，
--- 一个反引号就把它切断，后面的内容被当成 JS 解析（/api/... 变成除法），
--- 报错位置离真正的原因很远。
-CREATE TABLE IF NOT EXISTS endpoints (
-  id         TEXT PRIMARY KEY,
-  providerId TEXT NOT NULL REFERENCES providers(id),
-  label      TEXT NOT NULL,
-  protocol   TEXT,
-  baseUrl    TEXT,
-  -- 厂商扩展参数的 JSON（GLM 的 thinking / reasoning_effort 等）。
-  extraBody  TEXT,
-  -- false 时不列在 /api/models 里，但配置还在（临时停用某个端点）。
-  enabled    INTEGER NOT NULL DEFAULT 1,
-  createdAt  INTEGER NOT NULL,
-  updatedAt  INTEGER NOT NULL
-);
-
--- 一个模型。
---
--- ⚠️ (endpointId, modelId) 唯一而不是 modelId 唯一 ——
--- 同一家厂商常有同名模型在不同端点上的情况，
--- 只按 modelId 去重会让「换个端点用同一个模型」存不进去。
-CREATE TABLE IF NOT EXISTS models (
-  id              TEXT NOT NULL,
-  endpointId      TEXT NOT NULL REFERENCES endpoints(id),
-  label           TEXT NOT NULL,
-  -- low / high / max。GLM 默认是 max（最贵的一档），所以要显式记。
-  reasoningEffort TEXT,
-  enabled         INTEGER NOT NULL DEFAULT 1,
-  createdAt       INTEGER NOT NULL,
-  updatedAt       INTEGER NOT NULL,
-  PRIMARY KEY (endpointId, id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_models_endpoint ON models(endpointId, enabled);
 `

@@ -1,6 +1,10 @@
-# 01 · 契约（v1冻结）
+# 01 · 契约（v2）
 
-**冻结日期** 2026-10-08 ｜ **状态** v1 冻结
+**v1 冻结** 2026-10-08 ｜ **v2** 2026-10-12
+
+v2 拿掉会话上的 `endpointId` / `modelId`，以及厂商 / 端点 / 模型目录。
+厂商 key、协议互译、推理档位在 Magpie。little-one 只向 Magpie 发 Chat Completions，
+模型名是部署参数 `MAGPIE_MODEL`。预算与用量仍在。
 
 这份文件是 little-one（Agent Runtime）对外的**唯一契约**。实现可以换、SDK 可以换、
 工具可以增删——但这里写的事件名、data 形状、状态码语义**不能改**，
@@ -80,8 +84,6 @@ DELETE /api/sessions/:sessionId
   "tools": ["clipboard.list", "clipboard.create"],
   "instructions": "可选的额外系统指令",
   "engine": "little-one",
-  "endpointId": "zhipu",
-  "modelId": "glm-5.3",
   "sandboxApproval": false,
   "businessApproval": true
 }
@@ -95,10 +97,8 @@ DELETE /api/sessions/:sessionId
   `claude`（委托沙箱里的 claude-cli 做脱手长程任务）。未知值 → 400 `invalid_engine`。
   claude 引擎还没接线时**建会话可以成功**，发消息时才拿 409 `engine_not_available`
   （那时才需要沙箱就绪）。
-- **`endpointId` / `modelId`**（加法）：会话固定的端点与模型。不存在 → 400 `invalid_config`。
-  **claude 引擎强烈建议固定**：它 spawn 时从这两条 + 厂商 key 组出
-  `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`，取默认会拿到错协议的模型。
 - **`sandboxApproval` / `businessApproval`**（加法，默认 false / true）：双审批开关，见 §五。
+  模型名不在请求体里。出站模型是 `MAGPIE_MODEL`。
 
 响应 **201**（引擎与开关回显）：
 
@@ -229,53 +229,14 @@ GET /api/tools
 ### 枚举接口
 
 ```
-GET /api/healthz        → 见 §二
-GET /api/models         → { models: [{ id, label, provider }] }
-GET /api/config         → 见下面「配置目录」
+GET /healthz            → 见 §二
+GET /api/config         → { budget: { limit } }
+PUT /api/config/budget  → 见 §六
+GET /api/usage          → 见 §六
 ```
 
-`/api/models` 让 raven 能在会话创建时选模型，而不用把模型列表硬编码在前端。
-
-### 配置目录（2026-10-09 新增）
-
-服务 raven 的「模型与厂商」管理界面。**加路由不算契约变更**（§八：加东西永远可以）。
-
-```
-GET    /api/config                          → 一次返回三段 + 当前默认模型
-PUT    /api/config/providers/:id           → 增改厂商（apiKey 可选，不传 = 不改）
-POST   /api/config/providers/:id/probe    → 用该厂商的 key 发一条最短对话（不落库、响应不含 key）
-PUT    /api/config/endpoints/:id           → 增改端点
-PUT    /api/config/models                  → 增改模型（body 里带 endpointId）
-DELETE /api/config/providers/:id[?cascade=1]
-DELETE /api/config/endpoints/:id[?cascade=1]
-DELETE /api/config/models/:endpointId/:id
-```
-
-**一条不能破的：明文 key 永不出现在任何响应里。** 出口只有 `providers[].apiKeySet` /
-`apiKeySource` / `apiKeyHint`（末四位掩码）三个字段，连 `apiKey` 这个键都不存在。
-这不是「记得脱敏」，是做成了类型——想泄漏都泄漏不出去。
-
-⚠️ **key 的来源只有数据库**（2026-10-09 裁定）。厂商视图里**没有** `keyEnvVar`，
-`apiKeySource` 只有 `db` 与 `none` 两个值 —— 环境变量不再参与。
-
-这条裁定的原因是「两份真相」的代价：`apiKeySource` 原本要区分 `db` 与 `env`，
-而区分出来之后用户还是得猜哪份生效。唯一来源让这个问题消失。
-
-改 key 只有一个地方：这里。
-
-| 情况 | 状态码 | code |
-|---|---|---|
-| 厂商/端点下还有下级，且没给 `cascade` | 409 | `cascade_required` |
-| 参数不合法（协议名写错、`reasoningEffort` 不是 low/high/max） | 400 | `invalid_config` |
-| id 不存在 | 404 | `*_not_found` |
-
-⚠️ **409 与 400/404 必须分开**：409 的意思是「请求与当前状态冲突」，
-前端据此弹确认框；500 的意思是「服务端坏了」，前端只会显示「稍后重试」——
-而重试一万次也是同样的冲突。
-
-⚠️ **删除一律要求显式 `cascade=1`**，回执报清连带删了几个端点与模型。
-静默级联会让「我只想删这个厂商」变成「它的模型全没了」，而不可逆的动作没有回执
-是最糟的组合。
+v1 的 `/api/models` 与厂商 / 端点 / 模型目录已经不存在。打到那些路径是 404。
+厂商 key 与协议配在 Magpie，不进本服务的响应。
 
 ---
 
@@ -521,9 +482,8 @@ Instance（本进程，一用户一实例）
   业务读写仍经 MCP 走 raven 治理（§五）。
 
 两种引擎共享同一份 SSE 契约、同一套审批卡片、同一个 session 账本 ——
-**归一化的锚是契约，不是引擎**。claude 引擎 spawn 时用会话固定的
-`endpointId`/`modelId` + 厂商 key 组出 `ANTHROPIC_BASE_URL` / `ANTHROPIC_API_KEY`，
-配置目录零改动（复用现有表）。
+**归一化的锚是契约，不是引擎**。两条引擎都指向 Magpie：little-one 走 Chat Completions，
+claude 引擎把 `ANTHROPIC_BASE_URL` 指到 Magpie 的 origin。模型名都是 `MAGPIE_MODEL`。
 
 ### token 预算（2026-10-09）
 
@@ -531,7 +491,7 @@ Instance（本进程，一用户一实例）
   库外面的事 —— raven 与 little 的任何接口、字段、日志都不含金额。
 - **按厂商/模型分开统计**：`GET /api/usage` 返回 totals + byModel 分组
   + 预算余量。落账在 `usageLedger`，一次 run 一行。
-- **上限是实例级的一个数**（配置目录 `PUT /api/config/budget`，null = 不设防），
+- **上限是实例级的一个数**（`PUT /api/config/budget`，null = 不设防），
   检查点在 **run 启动前**：累计已超 → **409 `budget_exhausted`**（真状态码，
   与 `run_in_progress` 同理必须在开流前判）。
 - **运行中逐 token 掐断做不到**（usage 在 run 收尾才给全量）——

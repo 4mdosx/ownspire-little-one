@@ -32,99 +32,17 @@ import type { Risk, ToolDefinition } from '../tools/registry.js'
  */
 
 /**
- * # 协议族 · Adapter 的切分依据
- *
- * ⚠️ **Adapter 按协议切，不按厂商切** —— 但**协议是厂商的一个属性**，
- * 所以 endpoint 表里同时有两列（providerId + protocol）。
- *
- * ## 为什么不是「一家厂商一个 Adapter」
- *
- * GLM / DeepSeek / Kimi / OpenAI 官方全都是 OpenAI Chat Completions，
- * 一个 Adapter + 四行配置就够。它们真正需要适配的差别只有
- * baseURL 与扩展参数，**不是流形状**。
- *
- * ## 为什么协议不能挂在「厂商」名下
- *
- * 因为**同一家厂商的多个端点协议不同**：
- *
- * | 端点 | 协议 |
- * |---|---|
- * | `open.bigmodel.cn/api/paas/v4` | OpenAI Chat Completions |
- * | `open.bigmodel.cn/api/v1` | **OpenAI Responses** |
- * | `open.bigmodel.cn/api/anthropic` | **Anthropic Messages** |
- *
- * 所以结构是**厂商 → 端点 → 协议**（端点里的 protocol 列可以覆盖厂商默认）。
- * GLM 的 v4 端点挂 vercel-ai adapter，anthropic 端点挂 claude adapter，
- * 两个都用智谱的 key —— **key 属于厂商，adapter 属于协议。**
+ * little-one 引擎出站只说 OpenAI Chat Completions，打到本机 Magpie。
+ * Chat / Responses / Messages 的互译、厂商 key、推理档位都在 Magpie。
+ * `drivers.get` 对这个引擎永远拿这个值。
  */
-export type ProtocolFamily =
-  /** OpenAI Chat Completions（`/chat/completions`）。GLM / DeepSeek / Kimi / OpenAI。 */
-  | 'openai-chat-completions'
-  /** OpenAI Responses（`/responses`）。智谱 `/api/v1`、OpenAI 官方。 */
-  | 'openai-responses'
-  /** Anthropic Messages（`/messages`）。智谱 `/api/anthropic`、Claude。 */
-  | 'anthropic-messages'
-  /** 自家 SDK，不走协议。 */
-  | 'sdk'
-
-/**
- * 一个模型端点的配置。**Adapter 用它决定怎么调模型。**
- *
- * ⚠️ **2026-10-09 变化**：`apiKey` 现在存在了。此前这里刻意没有它，
- * 理由是「协议层用不到，却会被日志和错误信息带出去」。
- * 那个理由对**协议层仍然成立** —— 所以它只是「路过」，不是被解释：
- * 协议层任何代码都不读它、不写进错误信息、不打日志。
- *
- * ⚠️ 顺带两条同源的纪律：
- * - **这里没有 `keyEnvVar`**（2026-10-09 再删）。key 只从库里来，
- *   而「key 的环境变量名」是环境变量参与配置时代的产物 ——
- *   留着它就等于给协议层留一个已经失效的输入。
- * - **这里也没有 providerId** —— Adapter 不需要知道端点属于哪家厂商
- *   （key 通过 apiKey 拿，协议通过 protocol 定）。
- *   界面要按厂商分组时用 registry-store 的行视图，那是给界面看的，不是协议层的输入。
- * **协议层不解释的字段，就不该在协议层出现。**
- */
-export type EndpointConfig = {
-  /** 端点 id，如 `zhipu` / `deepseek`。**只是标识，不决定用哪个 Adapter。** */
-  id: string
-  label: string
-  /** 走哪种协议。**这一列才决定 Adapter。** */
-  protocol: ProtocolFamily
-  /** HTTP 端点。用 SDK 协议族时可以留空（SDK 有默认值）。 */
-  baseUrl?: string
-  /**
-   * **已经解析好的 key**，来自 `providers.apiKey`。解析在 db 层做。
-   *
-   * undefined 表示库里没填 —— 此时**不要自己编一句「缺少 key」**，
-   * 把 undefined 交给 SDK，它报的错误会指出这个厂商没配。
-   */
-  apiKey?: string
-  /**
-   * 该协议下的厂商扩展参数。**key 是 OpenAI 的参数名空间**
-   * （用 `@ai-sdk/openai` 时它读的就是 `providerOptions.openai`）。
-   *
-   * 例：GLM 要 `{ thinking: { type: 'enabled' }, reasoning_effort: 'high' }`。
-   * 放这里而不是散在代码里，是因为**它随厂商变、不随协议变** ——
-   * GLM 与 DeepSeek 都是 OpenAI Chat Completions，但只有前者要 thinking。
-   */
-  extraBody?: Record<string, unknown>
-}
-
-/** 模型清单里的一项。 */
-export type ModelConfig = {
-  id: string
-  label: string
-  /** 属于哪个端点。 */
-  endpointId: string
-  /** 默认档位。GLM 的 `reasoning_effort` 默认是 `max`（最贵），所以要显式记。 */
-  reasoningEffort?: 'low' | 'high' | 'max'
-}
+export const LITTLE_ONE_WIRE = 'openai-chat-completions'
 
 /** 驱动一轮对话所需的全部输入。**协议层与 Adapter 的唯一交界面。** */
 export type DriverRequest = {
   runId: string
-  endpoint: EndpointConfig
-  model: ModelConfig
+  /** Magpie 认识的模型名。协议层不解释它属于哪家厂商。 */
+  modelId: string
   instructions?: string
   /**
    * 对话历史。**已经是模型无关的形状了** —— 见 `ChatMessage`。
@@ -257,7 +175,7 @@ export type DriverHooks = {
 /**
  * ## 一个 Driver 的完整职责
  *
- * 1. 按 `endpoint` 决定用哪个 SDK / 哪个原生 HTTP
+ * 1. 用 `modelId` 向唯一上游发这一轮（地址与 key 不在这份请求里）
  * 2. 把 `ChatMessage[]` 翻译成 SDK 的消息格式
  * 3. 把 `tools` 翻译成 SDK 的工具定义
  * 4. **把工具声明的 `risk` 翻译成 SDK 的审批机制**
@@ -268,7 +186,7 @@ export type DriverHooks = {
  * **不许做**：改事件形状、自己发明 status、决定工具是否需要授权（那是 `risk` 决定的）。
  */
 export interface AgentDriver {
-  /** 端点 id。Driver 自己声明能接哪些 —— 协议层按它挑 Driver。 */
+  /** 这条 Driver 接的线。little-one 引擎是 `LITTLE_ONE_WIRE`，claude 引擎是 `claude`。 */
   readonly handles: string
 
   /** 一轮对话。实现**必须**在 `emit` 里发终止事件（`run.completed` 或 `run.failed`）。 */
@@ -276,14 +194,13 @@ export interface AgentDriver {
 }
 
 /**
- * 按端点挑 Driver。
+ * 按出站协议挑 Driver。
  *
- * ⚠️ **挑不中时抛错，不返回 null。** 返回 null 会让调用点写
- * `if (!driver)` 分支，而那种分支的典型处理是「静默降级」——
- * 于是配置写错端点 id 的症状变成「工具都不工作了」，很难查。
+ * 挑不中时抛错，不返回 null。返回 null 会让调用点写 `if (!driver)`，
+ * 那种分支的典型处理是静默降级，症状变成「工具都不工作了」。
  */
 export type DriverRegistry = {
-  get(endpointId: string): AgentDriver
+  get(wire: string): AgentDriver
   list(): string[]
 }
 

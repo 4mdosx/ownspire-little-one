@@ -60,7 +60,7 @@ async function testHappyPath(): Promise<void> {
   const { store, calls } = createFakeStore()
   const { events, emit } = collector()
 
-  await executeTurn({ drivers: registryOf([driver]), store }, {
+  await executeTurn({ drivers: registryOf([driver]), store, modelId: 'fake-model' }, {
     sessionId: 's1',
     content: '回显 hi',
     approvalResponses: [],
@@ -93,8 +93,6 @@ async function testApprovalDenied(): Promise<void> {
       instructions: null,
       tools: JSON.stringify([{ name: 'removeFile', risk: 'destructive' }]),
       engine: 'little-one',
-      endpointId: null,
-      modelId: null,
       engineSessionId: null,
       sandboxApproval: false,
       businessApproval: true,
@@ -102,7 +100,7 @@ async function testApprovalDenied(): Promise<void> {
   })
   const { events, emit } = collector()
 
-  await executeTurn({ drivers: registryOf([driver]), store }, {
+  await executeTurn({ drivers: registryOf([driver]), store, modelId: 'fake-model' }, {
     sessionId: 's1',
     content: '删掉 a',
     approvalResponses: [],
@@ -127,7 +125,7 @@ async function testErrorPaths(): Promise<void> {
     const { driver } = createFakeDriver({ script: [] })
     const { store } = createFakeStore({ findSession: () => undefined })
     try {
-      await executeTurn({ drivers: registryOf([driver]), store }, {
+      await executeTurn({ drivers: registryOf([driver]), store, modelId: 'fake-model' }, {
         sessionId: 'nope',
         content: 'x',
         approvalResponses: [],
@@ -148,7 +146,7 @@ async function testErrorPaths(): Promise<void> {
     const { driver } = createFakeDriver({ script: [] })
     const { store } = createFakeStore({ hasRunningRun: () => true })
     try {
-      await executeTurn({ drivers: registryOf([driver]), store }, {
+      await executeTurn({ drivers: registryOf([driver]), store, modelId: 'fake-model' }, {
         sessionId: 's1',
         content: 'x',
         approvalResponses: [],
@@ -169,7 +167,7 @@ async function testErrorPaths(): Promise<void> {
     const { driver } = createFakeDriver({ script: [] })
     const { store } = createFakeStore()
     try {
-      await executeTurn({ drivers: registryOf([driver]), store }, {
+      await executeTurn({ drivers: registryOf([driver]), store, modelId: 'fake-model' }, {
         sessionId: 's1',
         content: '   ',
         approvalResponses: [],
@@ -193,7 +191,7 @@ async function testErrorPaths(): Promise<void> {
     const { store, calls } = createFakeStore()
     let thrown: unknown = null
     try {
-      await executeTurn({ drivers: registryOf([driver]), store }, {
+      await executeTurn({ drivers: registryOf([driver]), store, modelId: 'fake-model' }, {
         sessionId: 's1',
         content: 'x',
         approvalResponses: [],
@@ -215,11 +213,10 @@ async function testErrorPaths(): Promise<void> {
 async function testProtocolMismatch(): Promise<void> {
   console.log('\n[Driver · 协议不匹配]')
   const { driver } = createFakeDriver({ script: [] })
-  const { store } = createFakeStore({
-    resolveEndpoint: () => ({ id: 'x', label: 'X', protocol: 'openai-responses' }),
-  })
+  const mismatch: AgentDriver = { ...driver, handles: 'not-the-wire' }
+  const { store } = createFakeStore()
   try {
-    await executeTurn({ drivers: registryOf([driver]), store }, {
+    await executeTurn({ drivers: registryOf([mismatch]), store, modelId: 'fake-model' }, {
       sessionId: 's1',
       content: 'x',
       approvalResponses: [],
@@ -346,7 +343,7 @@ function testParallelOrdering(): void {
     { kind: 'tool-call', callId: 'c', tool: 'ls', input: {}, seq: 3 },
   ]
   const { driver, log } = createFakeDriver({ script: steps })
-  void executeTurn({ drivers: registryOf([driver]), store: createFakeStore().store }, {
+  void executeTurn({ drivers: registryOf([driver]), store: createFakeStore().store, modelId: 'fake-model' }, {
     sessionId: 's1',
     content: 'x',
     approvalResponses: [],
@@ -369,7 +366,7 @@ async function testBudgetAndSwitches(): Promise<void> {
     })
     const { emit } = collector()
     try {
-      await executeTurn({ drivers: registryOf([driver]), store }, {
+      await executeTurn({ drivers: registryOf([driver]), store, modelId: 'fake-model' }, {
         sessionId: 's1', content: 'x', approvalResponses: [], emit,
       })
       check('预算超限要抛错', false, '没有抛')
@@ -387,12 +384,12 @@ async function testBudgetAndSwitches(): Promise<void> {
       findSession: () => ({
         id: 's1', instructions: null,
         tools: JSON.stringify([{ name: 'echo', risk: 'read' }]),
-        engine: 'little-one', endpointId: null, modelId: null, engineSessionId: null,
+        engine: 'little-one', engineSessionId: null,
         sandboxApproval: true, businessApproval: false,
       }),
     })
     const { emit } = collector()
-    await executeTurn({ drivers: registryOf([driver]), store }, {
+    await executeTurn({ drivers: registryOf([driver]), store, modelId: 'fake-model' }, {
       sessionId: 's1', content: 'x', approvalResponses: [], emit,
     })
     check('businessApproval=false 透传给 Driver', log.requests[0]?.businessApproval === false, log.requests[0]?.businessApproval)
@@ -404,7 +401,7 @@ async function testBudgetAndSwitches(): Promise<void> {
     const { driver, log } = createFakeDriver({ script: [{ kind: 'text', text: '好了。' }] })
     const { store } = createFakeStore()
     const { emit } = collector()
-    await executeTurn({ drivers: registryOf([driver]), store }, {
+    await executeTurn({ drivers: registryOf([driver]), store, modelId: 'fake-model' }, {
       sessionId: 's1', content: 'x', approvalResponses: [], emit,
     })
     check('默认会话显式传 businessApproval=true', log.requests[0]?.businessApproval === true, log.requests[0]?.businessApproval)
@@ -416,7 +413,7 @@ async function testBudgetAndSwitches(): Promise<void> {
     const { driver } = createFakeDriver({ script: [{ kind: 'text', text: '好了。' }] })
     const { store, calls } = createFakeStore()
     const { emit } = collector()
-    await executeTurn({ drivers: registryOf([driver]), store }, {
+    await executeTurn({ drivers: registryOf([driver]), store, modelId: 'fake-model' }, {
       sessionId: 's1', content: 'x', approvalResponses: [], emit,
     })
     check('成功收尾调用 recordUsage', calls.includes('recordUsage'), calls)

@@ -1,4 +1,4 @@
-# 02 · 分层：协议层 / Adapter / 目录层
+# 02 · 分层：协议层 / Adapter / Magpie
 
 **契约（01）说「线上是什么形状」，这份说「代码为什么这么切」。**
 
@@ -18,69 +18,49 @@
    │  Adapter  src/drivers/<name>/        │  ← 唯一 import `ai` 的地方
    │  消息翻译 · 审批翻译 · 流 → 事件      │
    └──────────────────────────────────────┘
-                 │
-                 ▼   目录层 src/db/registry-store.ts
-        厂商 → 端点(协议) → 模型      ← 配置全在库里
+                 │  只说 openai-chat-completions
+                 ▼
+              Magpie（本机进程）
+        厂商 key · 协议互译 · 推理档位
 ```
 
 **协议层不在 raven 里。** raven 是 Agent 的宿主与工具提供方，它一旦承担
 「SDK 抽象」，依赖方向就倒回去（`raven → agent SDK`）。
 
-## 二、Adapter 按协议切，不按厂商切
+## 二、出站只说一套协议
 
-被智谱的端点布局逼出来的：
+little-one 引擎的 Driver 只发 OpenAI Chat Completions，地址是 `MAGPIE_BASE_URL`。
+Chat / Responses / Messages 的互译、厂商 key、`thinking` / `reasoning_effort`
+都由 Magpie 写进上游请求。会话不存端点，也不存模型名。
 
-| 端点 | 协议 |
-|---|---|
-| `open.bigmodel.cn/api/paas/v4` | `openai-chat-completions` |
-| `open.bigmodel.cn/api/v1` | `openai-responses` |
-| `open.bigmodel.cn/api/anthropic` | `anthropic-messages` |
+模型名是部署参数 `MAGPIE_MODEL`（Magpie 上的 `provider/model` 或路由组）。
+claude 引擎是另一条 loop：它把 Anthropic 环境变量指到 Magpie 的 origin，模型名仍是同一个。
 
-一家厂商三种协议。按厂商切的话 GLM 要挂三个 adapter，而 OpenAI 官方
-得挂在「GLM 那个」旁边 —— **名字一样但协议不同，那不是分组，是巧合。**
+旧库里的 `providers` / `endpoints` / `models` 在 `SCHEMA_VERSION` 2 启动时整表删掉。
+会话行留下。`sessions.endpointId` / `sessions.modelId` 走 `DROP COLUMN`。
 
-反过来，**协议相同就能共用一个 Adapter**：GLM / DeepSeek / Kimi / OpenAI 官方
-全是 `openai-chat-completions`，一个 adapter + 几行库配置。
-
-`ProtocolFamily` 是**生产概念**，加一个值意味着要写一个 Adapter。
-测试里的假协议用断言绕开，**不往生产类型里加 'fake'**。
-
-## 三、厂商 → 端点 → 模型
-
-| 表 | 承担 | 不承担 |
-|---|---|---|
-| `providers` | 厂商 + **key** + 默认协议 | —— |
-| `endpoints` | 属于哪个厂商、**走哪种协议**、baseUrl、厂商扩展参数 | 凭据 |
-| `models` | 挂在哪个端点、默认 reasoning_effort | —— |
-
-- **key 只在库里**（2026-10-09 裁定）。此前还有一列 `keyEnvVar` 做环境变量兜底，
-  现在删了 —— 「两处来源、一处生效」的模型里，用户改错地方却看到「已保存」。
-  代价明说：**key 会出现在数据库备份里**；换来的补偿是出站接口永不回显它。
-- **端点可覆盖厂商的默认协议。** 同一厂商多端点多协议是常态。
-- **模型按 `(endpointId, id)` 唯一**，不是按 `id` —— 同名模型在不同端点各存一份。
-
-**接一家新厂商（协议已支持）**：只改数据库，不动代码。
-**接一种新协议**：写一个 Adapter + 在 `src/drivers/index.ts` 注册一行。
+**换上游模型**：改 `MAGPIE_MODEL`，或在 Magpie 里改路由组指向的模型。
+**接一种新的厂商协议**：改 Magpie 的配置，不在 little-one 里再写 Adapter。
 
 ## 四、三组测试，各验各的
 
 | 组 | 命令 | 验什么 | 不碰什么 |
 |---|---|---|---|
 | A 协议层 | `verify:protocol` | 编排语义：授权拦阻、步数上限、事件顺序、错误归类、上下文重建 | 任何 SDK |
-| B Adapter | `verify:driver` | 翻译正确性：消息形状、并行 seq、审批配置、厂商扩展参数 | 数据库 |
-| C 目录层 | `verify:registry` | 外键与唯一约束、协议继承与覆盖、**key 只从库里来** | 模型调用 |
-| 迁移 | `verify:migration` | **旧库启动时自动删列，且不丢数据** | —— |
+| B Adapter | `verify:driver` | 翻译正确性：消息形状、并行 seq、审批配置；请求不带厂商扩展参数 | 数据库 |
+| 库形状 | `verify:registry` | 空库没有厂商 / 端点 / 模型表，会话上没有 endpointId / modelId | 模型调用 |
+| 迁移 | `verify:migration` | 旧目录表被删掉，会话还在，schemaVersion 写成 2 | —— |
 | 纯度 | `verify:purity` | `src/protocol|tools|lib` 不许 import SDK | —— |
 
 **A 用假 Driver，B 用 SDK 官方 mock**（不是自写的假 provider —— 2026-10-08
 排查 `ai@7.0.70` 回归时两者行为不一致，白绕了很久）。
 
 ⚠️ **迁移那组必须单独一个进程**：它要验的是「一个已经存在的旧结构」，
-而 C 是在空库上跑 `ensureSchema()` 的 —— 那种库里永远没有要删的列，
+而库形状那组是在空库上跑 `ensureSchema()` 的 —— 那种库里永远没有要删的表，
 于是迁移代码**一次都不会被执行**。自动迁移最典型的失败方式恰恰是
 「从没被执行过」：代码看起来对、类型过得去、单测全绿，线上第一次跑旧库才炸。
 
-换 SDK 时：**A 一行不用改，只有 B 重写。** C 与迁移组完全不动。
+换 SDK 时：**A 一行不用改，只有 B 重写。**
 
 ## 五、Vercel AI Adapter 兜住的四条 SDK 坑
 
@@ -95,10 +75,6 @@
 4. **`system` 消息必须转成 `instructions`** —— 留在 messages 里会让
    `ToolLoopAgent` 抛 `AI_InvalidPromptError`，而它在 `ModelMessage` 里是合法角色。
 
-## 六、两个容易踩的部署坑
+## 六、启动条件
 
-- **启动顺序**：`bootstrap()`（建库 + seed 目录）必须在配置检查之前。
-  顺序反了会「库是空的 → 判成没配模型 → 拒绝启动」。
-- **启动条件是「至少有一个可用端点」**，不是「所有厂商都有 key」。
-  内置厂商是自动 seed 的，用后者当条件等于「不配 DeepSeek 就起不来」。
-  缺 key 的厂商记警告即可。
+`MAGPIE_MODEL` 没设就拒绝启动。厂商 key 和协议不在这个进程里检查。

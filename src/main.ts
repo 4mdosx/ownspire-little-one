@@ -1,3 +1,4 @@
+import { ensureMagpie } from './magpie-process.js'
 import { startServer } from './server.js'
 
 /**
@@ -17,4 +18,7 @@ process.on('uncaughtException', (error) => {
   process.exit(1)
 })
 
-startServer()
+void (async () => {
+  await ensureMagpie()
+  await startServer()
+})()

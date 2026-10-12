@@ -4,6 +4,7 @@ import type { AgentEvent } from '../../src/lib/sse.js'
 import type { ToolDefinition } from '../../src/tools/registry.js'
 import { z } from 'zod'
 import { createClaudeDriver } from '../../src/drivers/claude/driver.js'
+import { magpieApiKey, magpieOrigin } from '../../src/upstream.js'
 
 /**
  * # claude Driver 验证 · 假 query
@@ -60,14 +61,7 @@ function fakeQuery(script: unknown[], captured: { options?: SdkOptions }) {
 
 const baseRequest = (overrides: Partial<DriverRequest> = {}): DriverRequest => ({
   runId: 'run_x',
-  endpoint: {
-    id: 'aaa',
-    label: 'AAA',
-    protocol: 'anthropic-messages',
-    baseUrl: 'http://127.0.0.1:5919',
-    apiKey: 'sk-test',
-  },
-  model: { id: 'glm-5.3', label: 'GLM', endpointId: 'aaa' },
+  modelId: 'zhipu/glm-5.3',
   messages: [{ role: 'user', content: '干活' }],
   tools: [businessTool as unknown as ToolDefinition<never>],
   maxSteps: 20,
@@ -137,8 +131,10 @@ async function main(): Promise<void> {
     check('success → status done', result.status === 'done', result.status)
     check('resume 未设时 options 无 resume', (captured.options as any)?.resume === undefined, captured.options?.resume)
     check('maxSteps 映射为 maxTurns', captured.options?.maxTurns === 20, captured.options?.maxTurns)
-    check('endpoint.baseUrl → ANTHROPIC_BASE_URL', (captured.options?.env as any)?.ANTHROPIC_BASE_URL === 'http://127.0.0.1:5919')
-    check('endpoint.apiKey → ANTHROPIC_AUTH_TOKEN', (captured.options?.env as any)?.ANTHROPIC_AUTH_TOKEN === 'sk-test')
+    const env = captured.options?.env as Record<string, string> | undefined
+    check('ANTHROPIC_BASE_URL 指向 Magpie', env?.ANTHROPIC_BASE_URL === magpieOrigin(), env?.ANTHROPIC_BASE_URL)
+    check('ANTHROPIC_AUTH_TOKEN 是 Magpie 网关 key', env?.ANTHROPIC_AUTH_TOKEN === magpieApiKey())
+    check('ANTHROPIC_MODEL 是请求里的模型名', env?.ANTHROPIC_MODEL === 'zhipu/glm-5.3')
     check('业务工具挂成进程内 MCP server', 'ownspire' in (captured.options?.mcpServers ?? {}), Object.keys(captured.options?.mcpServers ?? {}))
   }
 

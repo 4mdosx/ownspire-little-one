@@ -4,7 +4,6 @@ import type {
   ChatMessage,
   DriverHooks,
   DriverRequest,
-  EndpointConfig,
 } from '../../src/protocol/driver.js'
 import type { Emit } from '../../src/lib/sse.js'
 import { tool } from '../../src/tools/registry.js'
@@ -25,9 +24,8 @@ import {
  * ## 怎么把 mock 塞进去
  *
  * 用 `createVercelAiDriver(() => mockModel)` 建一个注入版 Driver。
- * ⚠️ **不要把 mock 塞进 `request.model`** —— 那是 `ModelConfig`（纯数据），
- * 塞 SDK 对象进去得到的是 `model.id === undefined`，
- * 症状是 SDK 内部 `modelId.startsWith()` 崩在一个完全不相干的栈里。
+ * ⚠️ **不要把 mock 塞进 `request.modelId`** —— 那是模型名字符串。
+ * 塞 SDK 对象进去会在 `modelId.startsWith()` 崩在一个完全不相干的栈里。
  *
  * ## 验什么
  *
@@ -139,20 +137,10 @@ const destructiveTool = tool({
   execute: async () => ({ deleted: true }),
 })
 
-const ENDPOINT: EndpointConfig = {
-  id: 'zhipu-chat',
-  label: '智谱',
-  protocol: 'openai-chat-completions',
-  baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
-  // ⚠️ GLM 的 thinking 走这里。**用 `disabled` 是直接请求失败**，不是建议。
-  extraBody: { thinking: { type: 'enabled' } },
-}
-
 function baseRequest(overrides: Partial<DriverRequest> = {}): DriverRequest {
   return {
     runId: 'run_b',
-    endpoint: ENDPOINT,
-    model: { id: 'glm-5.3', label: 'GLM-5.3', endpointId: 'zhipu-chat', reasoningEffort: 'high' },
+    modelId: 'zhipu/glm-5.3',
     instructions: '测试',
     messages: [{ role: 'user', content: 'hello' }],
     tools: [testTool, destructiveTool] as never,
@@ -456,57 +444,19 @@ function testErrorClassification(): void {
   )
 }
 
-async function testGlmProviderOptions(): Promise<void> {
-  console.log('\n[翻译 · 厂商扩展参数的两档来源]')
+async function testNoVendorOptions(): Promise<void> {
+  console.log('\n[翻译 · 不带厂商扩展]')
 
   const model = await officialMock([script.text('好')])
   const { emit, hooks } = collector()
   await driverFor(model).run(baseRequest(), hooks, emit)
 
-  // ⚠️ `providerOptions` 的键是 **provider 名**（openai），不是模型名。
-  const openaiOptions = (lastCall?.providerOptions as { openai?: Record<string, unknown> } | undefined)
-    ?.openai
-  check('providerOptions.openai 存在', openaiOptions !== undefined, lastCall?.providerOptions)
+  const openaiOptions = (lastCall?.providerOptions as { openai?: Record<string, unknown> } | undefined)?.openai
   check(
-    '**thinking.type = enabled**（GLM 漏了这个直接请求失败）',
-    (openaiOptions?.thinking as { type?: string } | undefined)?.type === 'enabled',
-    openaiOptions,
+    '不带 thinking / reasoning_effort（这些由 Magpie 写上游）',
+    openaiOptions?.thinking === undefined && openaiOptions?.reasoning_effort === undefined,
+    lastCall?.providerOptions,
   )
-  check(
-    'reasoning_effort 显式带了 high（不落到默认的 max，那是最贵一档）',
-    openaiOptions?.reasoning_effort === 'high',
-    openaiOptions,
-  )
-
-  console.log('\n[翻译 · 安全网：没配 extraBody 也兜底]')
-  // 端点没配 extraBody，但模型 id 是 glm- → 仍要带上 thinking。
-  // 这是「忘记配库也不会炸」那道防线：GLM 漏了 thinking 是**请求失败**，不是降级。
-  const bareEndpoint: EndpointConfig = { ...ENDPOINT, extraBody: undefined }
-  const { emit: e2, hooks: h2 } = collector()
-  await driverFor(await officialMock([script.text('好')])).run(
-    baseRequest({ endpoint: bareEndpoint }),
-    h2,
-    e2,
-  )
-  const bare = (lastCall?.providerOptions as { openai?: Record<string, unknown> } | undefined)?.openai
-  check('GLM 模型即使端点没配也带 thinking', (bare as { thinking?: unknown } | undefined)?.thinking !== undefined, bare)
-
-  console.log('\n[翻译 · 不该发的就别发]')
-  // 非 GLM 模型 + 没配 extraBody 的端点 → 一个扩展参数都不该有。
-  // 发给不支持的厂商是 400，而 400 的文案通常指不到是哪个参数。
-  const { emit: e3, hooks: h3 } = collector()
-  await driverFor(await officialMock([script.text('好')])).run(
-    baseRequest({
-      endpoint: bareEndpoint,
-      model: { id: 'deepseek-chat', label: 'DS', endpointId: 'zhipu-chat' },
-    }),
-    h3,
-    e3,
-  )
-  const dsOptions = (lastCall?.providerOptions as { openai?: Record<string, unknown> } | undefined)
-    ?.openai
-  check('**非 GLM 模型不带 thinking**（按模型 id 判，不按 baseURL）', dsOptions?.thinking === undefined, dsOptions)
-  check('也不带 reasoning_effort（没配就不发）', dsOptions?.reasoning_effort === undefined, dsOptions)
 }
 
 async function main(): Promise<void> {
@@ -518,7 +468,7 @@ async function main(): Promise<void> {
   await testApprovalConfig()
   await testMessageTranslation()
   testErrorClassification()
-  await testGlmProviderOptions()
+  await testNoVendorOptions()
 
   console.log(`\n${assertions - failures}/${assertions} 条断言通过。`)
   console.log('\n换成别家 SDK 时：协议层测试（组 A）不用改，只有这个文件重写。\n')

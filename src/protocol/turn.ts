@@ -1,5 +1,9 @@
-import type { DriverRegistry } from './driver.js'
-import type { ChatMessage, DriverHooks, EndpointConfig, ModelConfig } from './driver.js'
+import {
+  LITTLE_ONE_WIRE,
+  type ChatMessage,
+  type DriverHooks,
+  type DriverRegistry,
+} from './driver.js'
 import type { ToolDefinition } from '../tools/registry.js'
 // ⚠️ **不许 import `../drivers/index.js`。** 那会拉进 `@ai-sdk/openai`，
 // 协议层就不再是「零 SDK 依赖」了 —— 纯度检查只查直接 import，查不出这种
@@ -61,6 +65,8 @@ export type TurnDeps = {
   drivers: DriverRegistry
   /** 落库接口。**用窄接口而不是直接 import db** —— 这样协议层的测试能用假实现。 */
   store: TurnStore
+  /** Magpie 上的模型名。组装层从部署参数传入，协议层不读环境、不查目录。 */
+  modelId: string
 }
 
 export type TurnStore = {
@@ -69,8 +75,6 @@ export type TurnStore = {
     instructions: string | null
     tools: string
     engine: 'little-one' | 'claude'
-    endpointId: string | null
-    modelId: string | null
     /** claude 引擎的会话锚（claude 侧 session id）。 */
     engineSessionId: string | null
     /** 双审批开关（契约 §五）。true = 需要审批。 */
@@ -78,13 +82,11 @@ export type TurnStore = {
     businessApproval: boolean
   } | undefined
   /**
-   * 归一化用量落账（契约 §六）。厂商归属在 store 实现里解析 ——
-   * 协议层只给 endpointId + modelId，不碰 providerId（那是配置层的事）。
+   * 归一化用量落账（契约 §六）。协议层只给模型名，不解释厂商。
    */
   recordUsage(input: {
     runId: string
     sessionId: string
-    endpointId: string
     modelId: string
     inputTokens: number
     outputTokens: number
@@ -125,9 +127,6 @@ export type TurnStore = {
     error?: string
   }): void
   touchSession(sessionId: string): void
-resolveEndpoint(endpointId: string): EndpointConfig | undefined
-    /** 不给modelId 时**返回第一个可用模型** —— 而不是 undefined。 */
-    resolveModel(modelId?: string, endpointId?: string): ModelConfig | undefined
 }
 
 export type ExecuteTurnInput = {
@@ -162,9 +161,6 @@ export type ExecuteTurnInput = {
    * （跳过并警告，契约 §六），协议层只管把拿到的定义原样交给 Driver。
    */
   tools?: ToolDefinition<never>[]
-  /** 会话固定了端点/模型时用它，否则用默认。 */
-  endpointId?: string
-  modelId?: string
   approvalSecret?: string
   /** 步数上限。默认见 `DEFAULT_MAX_STEPS`。 */
   maxSteps?: number
@@ -206,7 +202,7 @@ export async function executeTurn(deps: TurnDeps, input: ExecuteTurnInput): Prom
         'budget_exhausted',
         409,
         `token 预算已用尽：累计 ${used.inputTokens + used.outputTokens} / 上限 ${limit}。` +
-          '去 raven 的配置目录调整或清除上限。',
+          '调整或清除 token 上限后再发。',
       )
     }
   }
@@ -216,29 +212,12 @@ export async function executeTurn(deps: TurnDeps, input: ExecuteTurnInput): Prom
     throw new TurnError('empty_content', 400, 'content 不能为空。')
   }
 
-  // ⚠️ **两个都可选**：没指定就取第一个可用模型。
-  //
-  // 早先的版本写成「没指定就是没配置」，那会让「库里配好了模型、
-  // 但这个会话没指定」变成 503 —— 而那是最常见的正常状态。
-  // 「模型没配」的判定属于**启动期**（key 缺不缺），不��每轮。
-  // 会话固定的端点/模型（2026-10-09 落库）优先于「取默认」——
-  // claude 引擎的会话必须固定在 Anthropic 协议端点上，取默认会拿到错协议的模型。
-  const sessionModelId = input.modelId ?? session.modelId ?? undefined
-  const sessionEndpointId = input.endpointId ?? session.endpointId ?? undefined
-  const model = sessionModelId
-    ? deps.store.resolveModel(sessionModelId, sessionEndpointId)
-    : (deps.store.resolveModel(undefined) ?? undefined)
-  const endpoint = (sessionEndpointId ? deps.store.resolveEndpoint(sessionEndpointId) : undefined) ??
-    (model ? deps.store.resolveEndpoint(model.endpointId) : undefined)
-
-  if (!model || !endpoint) {
-    // **到这里说明库里一个模型都没有** —— 那是真的没配，
-    // 而不是一个会话没指定。说清楚怎么修。
+  const modelId = deps.modelId.trim()
+  if (modelId === '') {
     throw new TurnError(
       'model_not_configured',
       503,
-      '没有可用的模型：models 表是空的，或指定的模型不存在。' +
-        '去 raven 的「模型与厂商」界面确认 providers / endpoints / models 三张表。'
+      '没有模型名。设置 MAGPIE_MODEL 为 Magpie 上的模型或路由组。',
     )
   }
 
@@ -264,7 +243,7 @@ export async function executeTurn(deps: TurnDeps, input: ExecuteTurnInput): Prom
         'claude 引擎尚未接线。确认沙箱里装了 claude-cli，且 drivers 注册表里有 handles 为 claude 的 Driver。',
       )
     }
-    const driver = deps.drivers.get(session.engine === 'claude' ? 'claude' : endpoint.protocol)
+    const driver = deps.drivers.get(session.engine === 'claude' ? 'claude' : LITTLE_ONE_WIRE)
     const messages = buildModelMessages(deps.store, sessionId, input.approvalResponses)
 
     const hooks: DriverHooks = {
@@ -309,8 +288,7 @@ export async function executeTurn(deps: TurnDeps, input: ExecuteTurnInput): Prom
     const result = await driver.run(
       {
         runId: run.id,
-        endpoint,
-        model,
+        modelId,
         ...(session.instructions ?? DEFAULT_INSTRUCTIONS
           ? { instructions: session.instructions ?? DEFAULT_INSTRUCTIONS }
           : {}),
@@ -356,8 +334,7 @@ export async function executeTurn(deps: TurnDeps, input: ExecuteTurnInput): Prom
     deps.store.recordUsage({
       runId: run.id,
       sessionId,
-      endpointId: endpoint.id,
-      modelId: model.id,
+      modelId,
       inputTokens: result.usage.inputTokens,
       outputTokens: result.usage.outputTokens,
     })

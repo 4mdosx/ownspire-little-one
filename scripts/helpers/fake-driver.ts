@@ -1,9 +1,9 @@
-import type {
-  AgentDriver,
-  DriverHooks,
-  DriverRequest,
-  DriverResult,
-  EndpointConfig,
+import {
+  LITTLE_ONE_WIRE,
+  type AgentDriver,
+  type DriverHooks,
+  type DriverRequest,
+  type DriverResult,
 } from '../../src/protocol/driver.js'
 import type { Emit } from '../../src/lib/sse.js'
 import type { StoredToolCall } from '../../src/protocol/turn.js'
@@ -60,7 +60,7 @@ export function createFakeDriver(options: FakeDriverOptions): { driver: AgentDri
   let stepIndex = 0
 
   const driver: AgentDriver = {
-    handles: 'fake-protocol',
+    handles: LITTLE_ONE_WIRE,
 
     async run(request: DriverRequest, hooks: DriverHooks, emit: Emit): Promise<DriverResult> {
       log.requests.push(request)
@@ -214,8 +214,6 @@ export function createFakeStore(overrides: Partial<import('../../src/protocol/tu
         instructions: null,
         tools: JSON.stringify([{ name: 'echo', risk: 'read' }]),
         engine: 'little-one',
-        endpointId: null,
-        modelId: null,
         engineSessionId: null,
         sandboxApproval: false,
         businessApproval: true,
@@ -249,14 +247,6 @@ export function createFakeStore(overrides: Partial<import('../../src/protocol/tu
     touchSession() {
       record('touchSession')
     },
-    resolveEndpoint() {
-      record('resolveEndpoint')
-      return { id: 'fake', label: 'fake', protocol: FAKE_PROTOCOL }
-    },
-    resolveModel() {
-      record('resolveModel')
-      return { id: 'fake-model', label: 'Fake', endpointId: 'fake' }
-    },
     recordUsage() {
       record('recordUsage')
     },
@@ -272,20 +262,4 @@ export function createFakeStore(overrides: Partial<import('../../src/protocol/tu
   }
 
   return { store: { ...base, ...overrides }, calls }
-}
-
-/**
- * 假 Driver 声明的协议。**故意不是一个真实协议** —— 这样「这组测试跑的是假
- * Driver」在代码里就看得出来：真 Driver 永远不会 handles 它，
- * 所以万一注册表被装错了，查不到 Driver 会立刻炸而不是静默用真的。
- *
- * ⚠️ 这个 `as` 是测试代码里唯一允许的类型断言：协议层的 `ProtocolFamily`
- * 是生产概念，不该为了测试往里加一个 'fake'。
- */
-export const FAKE_PROTOCOL = 'fake-protocol' as EndpointConfig['protocol']
-
-export const TEST_ENDPOINT: EndpointConfig = {
-  id: 'fake',
-  label: 'Fake',
-  protocol: FAKE_PROTOCOL,
 }

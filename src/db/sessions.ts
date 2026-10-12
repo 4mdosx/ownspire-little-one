@@ -21,9 +21,6 @@ export type SessionRow = {
   engine: 'little-one' | 'claude'
   /** claude 引擎的会话锚：claude 侧 session id（resume 靠它）。无写入方时为 null。 */
   engineSessionId: string | null
-  /** 会话固定的端点/模型。null = 用默认（claude 引擎建议固定，见契约 §三）。 */
-  endpointId: string | null
-  modelId: string | null
   /** 双审批开关（契约 §五）。true = 需要审批。 */
   sandboxApproval: boolean
   businessApproval: boolean
@@ -60,8 +57,6 @@ export function createSession(input: {
   instructions?: string
   tools: string[]
   engine?: 'little-one' | 'claude'
-  endpointId?: string
-  modelId?: string
   /** 默认 false：沙箱内工具自动通过（脱手定位，契约 §五）。 */
   sandboxApproval?: boolean
   /** 默认 true：业务工具需要审批（治理核心，契约 §五）。 */
@@ -71,10 +66,9 @@ export function createSession(input: {
   const sessionId = id('ses')
   run(
     `INSERT INTO sessions (id, title, instructions, tools, createdAt, updatedAt,
-                           engine, engineSessionId, endpointId, modelId,
-                           sandboxApproval, businessApproval)
+                           engine, engineSessionId, sandboxApproval, businessApproval)
      VALUES (:id, :title, :instructions, :tools, :createdAt, :updatedAt,
-             :engine, NULL, :endpointId, :modelId, :sandboxApproval, :businessApproval)`,
+             :engine, NULL, :sandboxApproval, :businessApproval)`,
     {
       id: sessionId,
       title: input.title,
@@ -83,8 +77,6 @@ export function createSession(input: {
       createdAt: timestamp,
       updatedAt: timestamp,
       engine: input.engine ?? 'little-one',
-      endpointId: input.endpointId ?? null,
-      modelId: input.modelId ?? null,
       sandboxApproval: (input.sandboxApproval ?? false) ? 1 : 0,
       businessApproval: (input.businessApproval ?? true) ? 1 : 0,
     },
@@ -100,7 +92,7 @@ export function findSession(sessionId: string): SessionRow | undefined {
 /**
  * ⚠️ SQLite 的 INTEGER 出来是 0/1，而 SessionRow 声明 boolean ——
  * 不转的话 `flags.businessApproval === false` 这类严格判断会静默失灵
- * （0 !== false）。转换只在这一处做，与 registry-store 的 toModel 同一套路。
+ * （0 !== false）。转换只在这一处做。
  */
 type RawSessionRow = Omit<SessionRow, 'sandboxApproval' | 'businessApproval'> & {
   sandboxApproval: number

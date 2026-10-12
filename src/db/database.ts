@@ -4,6 +4,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { resolveDbFile } from '../config/env.js'
 import {
   DROPPABLE_COLUMNS,
+  DROPPABLE_TABLES,
   LEGACY_INDEXES,
   LEGACY_TABLES,
   MIGRATABLE_COLUMNS,
@@ -72,6 +73,14 @@ export function ensureSchema(): void {
     }
   }
   database.exec(SCHEMA_SQL)
+  for (const item of DROPPABLE_TABLES) {
+    const found = database
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = ?")
+      .get(item.table) as { name?: string } | undefined
+    if (!found?.name) continue
+    database.exec(`DROP TABLE ${item.table}`)
+    console.log(`[agent] 已迁移：删掉表 ${item.table} —— ${item.reason}`)
+  }
   // ⚠️ **删掉的列要单独查，方向与加列相反。**
   //
   // `CREATE TABLE IF NOT EXISTS` 不动已存在的表，所以新 schema 删了一列之后，
@@ -125,7 +134,9 @@ export function ensureSchema(): void {
   // INSERT OR IGNORE —— 已有值说明库里是旧结构写的数据，保留旧值；
   // 升 SCHEMA_VERSION 时由对应的迁移步骤负责改写它，这里不覆盖。
   database
-    .prepare('INSERT OR IGNORE INTO _meta (key, value) VALUES (:key, :value)')
+    .prepare(
+      'INSERT INTO _meta (key, value) VALUES (:key, :value) ON CONFLICT(key) DO UPDATE SET value = :value',
+    )
     .run({ key: 'schemaVersion', value: String(SCHEMA_VERSION) })
   schemaReady = true
 }

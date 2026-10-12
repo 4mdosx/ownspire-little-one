@@ -17,6 +17,7 @@ import type {
 import type { Emit } from '../../lib/sse.js'
 import type { Risk, ToolDefinition } from '../../tools/registry.js'
 import { toJsonSchema } from '../../tools/registry.js'
+import { magpieApiKey, magpieOrigin } from '../../upstream.js'
 import { jsonSchemaToShape } from './json-schema-to-shape.js'
 
 /**
@@ -35,8 +36,9 @@ import { jsonSchemaToShape } from './json-schema-to-shape.js'
  *    （决策走下一条消息，§五 既定形状）；批准/拒绝的结论在下一轮 resume 时
  *    经 `approvalResponses` 消费 —— 签名匹配的放行并补发 resolved，
  *    被拒的再次 deny 并把 run 收成 `status: "denied"`。
- * 3. **配置复用**：endpointId/modelId/厂商 key 从现有表读出（turn 层传入），
- *    spawn 时组 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` —— 配置目录零改动。
+ * 3. **上游是 Magpie**：spawn 时 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`
+ *    指向本机网关。claude-cli 说 Messages，Magpie 再译到真正的厂商。
+ *    端点表上的厂商地址和 key 不进环境变量。
  *
  * ## resume 语义
  *
@@ -243,17 +245,16 @@ export function createClaudeDriver(deps: ClaudeDriverDeps = {}): AgentDriver {
         }
       }
 
-      // ---- spawn env：配置目录的表 → Anthropic 兼容端点 --------------------
+      // ---- spawn env：claude-cli 说 Messages，地址是 Magpie ----------------
       const env: Record<string, string> = {}
       for (const [key, value] of Object.entries(process.env)) {
         if (typeof value === 'string') env[key] = value
       }
-      if (request.endpoint.baseUrl) env.ANTHROPIC_BASE_URL = request.endpoint.baseUrl
-      if (request.endpoint.apiKey) {
-        env.ANTHROPIC_AUTH_TOKEN = request.endpoint.apiKey
-        env.ANTHROPIC_API_KEY = request.endpoint.apiKey
-      }
-      env.ANTHROPIC_MODEL = request.model.id
+      const gatewayKey = magpieApiKey()
+      env.ANTHROPIC_BASE_URL = magpieOrigin()
+      env.ANTHROPIC_AUTH_TOKEN = gatewayKey
+      env.ANTHROPIC_API_KEY = gatewayKey
+      env.ANTHROPIC_MODEL = request.modelId
 
       const abortController = new AbortController()
       if (request.signal) {

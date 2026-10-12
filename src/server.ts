@@ -26,31 +26,10 @@ import { createAgentStream, encodeFrame } from './lib/sse.js'
 import { listEvents, saveEvent } from './db/events.js'
 import { budgetLimit, setBudgetLimit, usageByModel, usageTotals } from './db/usage.js'
 import { runningRunId } from './db/sessions.js'
-import { findModel as lookupModelById, findEndpoint as lookupEndpointById } from './db/registry-store.js'
-import { probeProvider } from './probe.js'
 import { executeTurn, TurnError, type ApprovalResponseInput } from './protocol/turn.js'
+import { requireMagpieModel } from './upstream.js'
 import { drivers } from './drivers/index.js'
 import { store } from './db/store.js'
-import {
-  CascadeRequiredError,
-  ConfigError,
-  defaultModelId,
-  tryDefaultModelId,
-  deleteEndpoint,
-  deleteModel,
-  deleteProvider,
-  listEndpointRows,
-  listEndpoints,
-  listModels,
-  listProviderViews,
-  missingKeys,
-  seedBuiltinProviders,
-  toProtocol,
-  usableEndpoints,
-  upsertEndpoint,
-  upsertModel,
-  upsertProvider,
-} from './db/registry-store.js'
 import { toolCatalog, toolNames, resolveTools, UnknownToolError } from './tools/registry.js'
 import { loadRavenTools } from './tools/raven.js'
 import './tools/builtin.js'
@@ -84,60 +63,20 @@ export function buildRouter(token: string): Router {
       sessions,
       runs,
       running: databaseOk ? countRuns('running') : 0,
-      // ⚠️ **只报数量，不报 id。** key 属于厂商，而厂商 id 与端点 id 是配置信息 ——
-      // 「有哪些模型可用」要给，「有哪些 key」绝不能出现在免鉴权的接口里（契约 §二）。
-      models: databaseOk ? listModels().length : 0,
-      endpoints: databaseOk ? listEndpoints().length : 0,
       tools: toolNames().length,
     })
   })
 
   // ---- 枚举（鉴权）----------------------------------------------------------
 
-  router.get('/api/models', ({ req, res }) => {
-    requireAuth(req, token)
-    // ⚠️ **附上 endpointId 与 protocol**，因为前端可能需要按协议分组显示
-    // （比如「走智谱 Anthropic 协议的」放一起）。契约 §三的形状不变，
-    // 只是多了可选字段 —— 按契约 §八，加字段不需要升版本号。
-    const models = listModels().map((model) => {
-      const endpoint = listEndpoints().find((item) => item.id === model.endpointId)
-      return {
-        ...model,
-        ...(endpoint ? { endpointId: endpoint.id, protocol: endpoint.protocol } : {}),
-      }
-    })
-    sendJson(res, 200, { models, default: defaultModelId() || null })
-  })
-
   router.get('/api/tools', ({ req, res }) => {
     requireAuth(req, token)
     sendJson(res, 200, { tools: toolCatalog() })
   })
 
-  // ---- 配置目录（鉴权）：厂商 / 端点 / 模型 的增删改 ----------------
-  //
-  // ⚠️ 这组接口服务 raven 的「模型与厂商」管理界面。
-  //
-  // **一条不能破的：明文 key 永不出现在任何响应里。** 出口只有
-  // `listProviderViews()`那一个形状，它连apiKey 字段都没有 ——
-  // 「key 存在但不许出站」这条纪律做成了类型，而不是靠每个路由记得脱敏。
-  // 界面上要看key 状态，看 `apiKeySet` / `apiKeySource` / `apiKeyHint`。
-  //
-  // ⚠️ **写操作一律立即落库，不走「改配置要重启」那套缓存。**
-  // 目录层的缓存存在的理由是「一半请求用旧配置一半用新的很难查」，
-  // 而配置界面的整个意义就是「改完立刻能用」。
-  // 真正需要重启的是 key 那部分——它从库里读，不用重启。
-
   router.get('/api/config', ({ req, res }) => {
     requireAuth(req, token)
     sendJson(res, 200, {
-      providers: listProviderViews(),
-      endpoints: listEndpointRows(),
-      models: listModels(),
-      // ⚠️ 用 try 版：刚删掉当前默认模型时，「查一下默认是谁」不该让整个查询失败。
-      // 「配置坏了」是用户的编辑结果，不是「这个接口出错」。
-      defaultModel: tryDefaultModelId(),
-      // token 预算（契约 §六，2026-10-09 加法）。全程不出现钱。
       budget: { limit: budgetLimit() },
     })
   })
@@ -165,138 +104,6 @@ export function buildRouter(token: string): Router {
     })
   })
 
-  /** 配置类错误 → 400。用类型区分而不是匹配 message（那是把文案变成了控制流）。 */
-  function guardConfig<T>(fn: () => T): T {
-    try {
-      return fn()
-    } catch (error) {
-      if (error instanceof ConfigError) {
-        throw new HttpError(400, 'invalid_config', error.message)
-      }
-      if (error instanceof CascadeRequiredError) {
-        throw new HttpError(409, 'cascade_required', error.message)
-      }
-      throw error
-    }
-  }
-
-  router.put('/api/config/providers/:id', async ({ req, res, params }) => {
-    requireAuth(req, token)
-    const body = await readJson<{
-      label?: unknown
-      defaultProtocol?: unknown
-      apiKey?: unknown
-      clearApiKey?: unknown
-    }>(req)
-    const id = requireId(params.id)
-    const existing = listProviderViews().find((item) => item.id === id)
-    guardConfig(() =>
-      upsertProvider({
-        id,
-        label: requireText(body.label, existing?.label ?? id),
-        defaultProtocol:
-          typeof body.defaultProtocol === 'string'
-            ? toProtocol(body.defaultProtocol)
-            : (existing?.defaultProtocol ?? 'openai-chat-completions'),
-        // ⚠️ 字段不存在 = **不改**，不是清空。界面「保存」一个没碰 key 的表单
-        // 是常态，缺省等于清空的话用户改个标签就把 key 弄丢了。
-        ...(typeof body.apiKey === 'string' && body.apiKey.trim() !== '' ? { apiKey: body.apiKey } : {}),
-        ...(body.clearApiKey === true ? { clearApiKey: true } : {}),
-      })
-    )
-    sendJson(res, 200, { provider: listProviderViews().find((item) => item.id === id) })
-  })
-
-  /**
-   * 连接检测。POST 而不是 PUT：它不改目录，只发一条最短对话。
-   * 结果里没有 key。输入框里没保存的 key 可以放在 body.apiKey 里试，不会落库。
-   */
-  router.post('/api/config/providers/:id/probe', async ({ req, res, params }) => {
-    requireAuth(req, token)
-    const body = await readJson<{ apiKey?: unknown; endpointId?: unknown }>(req)
-    const result = await probeProvider({
-      providerId: requireId(params.id),
-      ...(typeof body.apiKey === 'string' ? { apiKey: body.apiKey } : {}),
-      ...(typeof body.endpointId === 'string' ? { endpointId: body.endpointId } : {}),
-    })
-    sendJson(res, 200, result)
-  })
-
-  router.put('/api/config/endpoints/:id', async ({ req, res, params }) => {
-    requireAuth(req, token)
-    const body = await readJson<Record<string, unknown>>(req)
-    const id = requireId(params.id)
-    // ⚠️ 这里要providerId（部分更新时回退到原厂商），而协议层的 EndpointConfig
-    // 不带它 —— 所以走界面专用的行视图。两个形状各有各的用处，别混用。
-    const existing = listEndpointRows().find((item) => item.id === id)
-    guardConfig(() =>
-      upsertEndpoint({
-        id,
-        providerId: requireText(body.providerId, existing?.providerId ?? ''),
-        label: requireText(body.label, existing?.label ?? id),
-        ...(typeof body.protocol === 'string'
-          ? { protocol: toProtocol(body.protocol) }
-          : existing?.protocol
-            ? { protocol: existing.protocol }
-            : {}),
-        ...(typeof body.baseUrl === 'string' ? { baseUrl: body.baseUrl } : {}),
-        ...(body.extraBody !== undefined && body.extraBody !== null
-          ? { extraBody: body.extraBody as Record<string, unknown> }
-          : {}),
-        ...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
-      })
-    )
-    sendJson(res, 200, { endpoint: listEndpointRows().find((item) => item.id === id) })
-  })
-
-  router.put('/api/config/models', async ({ req, res }) => {
-    requireAuth(req, token)
-    const body = await readJson<Record<string, unknown>>(req)
-    const id = requireText(body.id, '')
-    const endpointId = requireText(body.endpointId, '')
-    const existing = listModels().find((item) => item.id === id && item.endpointId === endpointId)
-    guardConfig(() =>
-      upsertModel({
-        id,
-        endpointId,
-        label: requireText(body.label, existing?.label ?? id),
-        ...(typeof body.reasoningEffort === 'string'
-          ? { reasoningEffort: body.reasoningEffort as 'low' | 'high' | 'max' }
-          : existing?.reasoningEffort
-            ? { reasoningEffort: existing.reasoningEffort as 'low' | 'high' | 'max' }
-            : {}),
-        ...(typeof body.enabled === 'boolean' ? { enabled: body.enabled } : {}),
-      })
-    )
-    sendJson(res, 200, { model: listModels().find((item) => item.id === id && item.endpointId === endpointId) })
-  })
-
-  // ⚠️ **删除一律要求显式 cascade**，且回执里报清连带删了什么。
-  // 静默级联会让「我只是想删这个厂商」变成「它的模型全没了」，
-  // 而不可逆的动作没有回执是最糟的组合。
-  router.delete('/api/config/providers/:id', ({ req, res, params }) => {
-    requireAuth(req, token)
-    const id = requireId(params.id)
-    const result = guardCascade(() => deleteProvider(id, cascadeOf(req)))
-    if (!result.deleted) throw new HttpError(404, 'provider_not_found', `厂商 ${id} 不存在。`)
-    sendJson(res, 200, { ...result, defaultModel: tryDefaultModelId() })
-  })
-
-  router.delete('/api/config/endpoints/:id', ({ req, res, params }) => {
-    requireAuth(req, token)
-    const id = requireId(params.id)
-    const result = guardCascade(() => deleteEndpoint(id, cascadeOf(req)))
-    if (!result.deleted) throw new HttpError(404, 'endpoint_not_found', `端点 ${id} 不存在。`)
-    sendJson(res, 200, result)
-  })
-
-  router.delete('/api/config/models/:endpointId/:id', ({ req, res, params }) => {
-    requireAuth(req, token)
-    const removed = deleteModel(requireId(params.id), requireId(params.endpointId))
-    if (!removed) throw new HttpError(404, 'model_not_found', `模型 ${params.id} 不存在。`)
-    sendJson(res, 200, { deleted: true })
-  })
-
   // ---- 会话（契约 §三）------------------------------------------------------
 
   router.post('/api/sessions', async ({ req, res }) => {
@@ -306,8 +113,6 @@ export function buildRouter(token: string): Router {
       instructions?: string
       tools?: string[]
       engine?: string
-      endpointId?: string
-      modelId?: string
       sandboxApproval?: boolean
       businessApproval?: boolean
     }>(req)
@@ -326,18 +131,6 @@ export function buildRouter(token: string): Router {
     if (engine !== 'little-one' && engine !== 'claude') {
       throw new HttpError(400, 'invalid_engine', `未知引擎：${engine}（可选 little-one / claude）`)
     }
-    // 固定了端点/模型就当场校验 —— 拖到发消息时才炸，错误会离原因隔一个
-    // 会话生命周期，查起来远。claude 引擎建议固定 Anthropic 协议端点（契约 §三）。
-    if (typeof body.endpointId === 'string' && body.endpointId !== '' && !lookupEndpointById(body.endpointId)) {
-      throw new HttpError(400, 'invalid_config', `端点不存在：${body.endpointId}`)
-    }
-    if (typeof body.modelId === 'string' && body.modelId !== '') {
-      const model = lookupModelById(
-        body.modelId,
-        typeof body.endpointId === 'string' && body.endpointId !== '' ? body.endpointId : undefined,
-      )
-      if (!model) throw new HttpError(400, 'invalid_config', `模型不存在：${body.modelId}`)
-    }
 
     const title =
       typeof body.title === 'string' && body.title.trim() !== '' ? body.title.trim() : '新会话'
@@ -346,8 +139,6 @@ export function buildRouter(token: string): Router {
       ...(typeof body.instructions === 'string' ? { instructions: body.instructions } : {}),
       tools: requested,
       engine,
-      ...(typeof body.endpointId === 'string' && body.endpointId !== '' ? { endpointId: body.endpointId } : {}),
-      ...(typeof body.modelId === 'string' && body.modelId !== '' ? { modelId: body.modelId } : {}),
       ...(typeof body.sandboxApproval === 'boolean' ? { sandboxApproval: body.sandboxApproval } : {}),
       ...(typeof body.businessApproval === 'boolean' ? { businessApproval: body.businessApproval } : {}),
     })
@@ -360,8 +151,6 @@ export function buildRouter(token: string): Router {
       engine: session.engine,
       sandboxApproval: session.sandboxApproval,
       businessApproval: session.businessApproval,
-      ...(session.modelId ? { modelId: session.modelId } : {}),
-      ...(session.endpointId ? { endpointId: session.endpointId } : {}),
     })
   })
 
@@ -516,7 +305,7 @@ export function buildRouter(token: string): Router {
           executeTurn(
             // ⚠️ deps 显式传进来，不在协议层里 import 具体实现 ——
             // 这样协议层的测试能传假 Driver 与假 store。
-            { drivers, store },
+            { drivers, store, modelId: requireMagpieModel() },
             {
               sessionId,
               content,
@@ -710,46 +499,6 @@ function requireId(raw: string | undefined): string {
   return id
 }
 
-/** 字段必须是非空字符串；没给就回退到现值（部分更新语义）。 */
-function requireText(value: unknown, fallback: string): string {
-  if (value === undefined || value === null) {
-    if (fallback === '') throw new HttpError(400, 'missing_field', '这个字段是必填的。')
-    return fallback
-  }
-  if (typeof value !== 'string' || value.trim() === '') {
-    throw new HttpError(400, 'invalid_field', '这个字段必须是非空字符串。')
-  }
-  return value.trim()
-}
-
-/**
- * 级联删除的开关。**只能是显式的 `cascade=1`/`true`** ——
- * 缺省一律当「不级联」，然后由下层报「还有 N 个端点/模型」并让用户确认。
- * 反过来（缺省就级联）的话，一次误点就没了，而用户看不到自己误点了什么。
- */
-function cascadeOf(req: http.IncomingMessage): boolean {
-  const raw = new URL(req.url ?? '/', 'http://localhost').searchParams.get('cascade')
-  return raw === '1' || raw === 'true'
-}
-
-/**
- * 把「还有下级」翻成 **409**。
- *
- * ⚠️ 必须是 409 而不是落回500：500 的意思是「服务端坏了」，而这里服务端好得很，
- * 是请求与当前状态冲突。raven 拿到 409 才知道「该弹确认框问用户」，
- * 拿到 500 只会显示一句「稍后重试」—— 而重试一万次也是同样的冲突。
- */
-function guardCascade<T>(fn: () => T): T {
-  try {
-    return fn()
-  } catch (error) {
-    if (error instanceof CascadeRequiredError) {
-      throw new HttpError(409, 'cascade_required', error.message)
-    }
-    throw error
-  }
-}
-
 /** 启动前检查。`ensureSchema` 幂等，撞到旧表直接抛错不自动搬数据。 */
 /**
  * 把 Router 接成 Node 的 request listener。
@@ -792,9 +541,6 @@ export function createRequestListener(router: Router): http.RequestListener {
 
 export function bootstrap(): { interrupted: number } {
   ensureSchema()
-  // ⚠️ **先建目录再检查配置** —— 内置的厂商/端点是在库里的，
-  // 顺序反了会「库是空的 → 判成没配模型 → 拒绝启动」，而真正的原因只是没 seed。
-  seedBuiltinProviders()
   return { interrupted: reconcileInterruptedRuns() }
 }
 
@@ -811,32 +557,7 @@ export async function startServer(): Promise<http.Server> {
     console.warn(`[agent] 上一进程留下 ${interrupted} 轮未完成，已标记为 interrupted。`)
   }
 
-  // ⚠️ **启动时就检查模型配置，不留到第一次对话。**
-  //
-  // 「没配 key 就起来、健康检查全绿、用户发消息才看到『模型调用失败』」
-  // 是一类很难查的问题：运维看不出哪里不对，而报错文案指向模型，
-  // 排查方向会被带去调 key —— 而真正的原因是压根没配厂商的 key。
-  //
-  // ⚠️ **按注册表检查，不硬认某一个环境变量。** 多家厂商各有自己的 key，
-  // 写死一个变量名会让「配了智谱的 key」也被判成没配。
-  // ⚠️ **缺 key 的厂商只警告，不拦启动。** 内置厂商是自动 seed 的，
-  // 拿「所有厂商都有 key」当启动条件等于「不填 DeepSeek 就起不来」。
-  // 真正要保证的是**至少有一个端点能连上**。
-  for (const item of missingKeys()) {
-    console.warn(`[agent] 厂商「${item.label}」（${item.provider}）没配 key，它的端点不会被使用。`)
-  }
-  if (usableEndpoints().length === 0) {
-    throw new Error(
-      '没有任何可用端点：所有启用的端点所属厂商都没配 key，或一个启用端点都没有。' +
-        '去 raven 的「模型与厂商」界面填 key（key 存在数据库里，不走环境变量）。'
-    )
-  }
-  if (defaultModelId() === '') {
-    throw new Error(
-      'models 表里没有启用的模型。不配的话每个请求都会打一个空模型 id，' +
-        '报错信息会指向 key 而不是缺配置。去 raven 的「模型与厂商」界面加一个。'
-    )
-  }
+  const modelId = requireMagpieModel()
 
   // ⚠️ 必须在 buildRouter 之前：路由里 `/api/tools` 直接读注册表，
   // 晚一步加载的话首屏会看到「0 个工具」，而工具其实是好的。
@@ -856,7 +577,7 @@ export async function startServer(): Promise<http.Server> {
   const server = http.createServer(createRequestListener(router))
 
   server.listen(listenPort, () => {
-    console.log(`[agent] 监听 ${listenPort}，契约 v${CONTRACT_VERSION}，模型 ${defaultModelId()}，工具 ${toolNames().length} 个。`)
+    console.log(`[agent] 监听 ${listenPort}，契约 v${CONTRACT_VERSION}，模型 ${modelId}，工具 ${toolNames().length} 个。`)
   })
 
   return server

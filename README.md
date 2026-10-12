@@ -13,9 +13,9 @@ ownspire 的 **Agent Runtime**：负责**模型下一步做什么**。
 | | |
 |---|---|
 | 端口 | 容器 **5900**（atlas 5600 · navi 5500 · raven 5800 之后的下一个） |
-| 契约 | **[docs/01-contract.md](docs/01-contract.md)** v1 冻结，改它需要升版本号 |
+| 契约 | **[docs/01-contract.md](docs/01-contract.md)** v2 |
 | 框架层 | `ai@7.0.60` —— Agent Loop，**不随模型换** |
-| 模型层 | `@ai-sdk/openai` —— 换厂商只改数据库配置，不改代码 |
+| 上游 | Magpie。little-one 只发 Chat Completions，模型名是 `MAGPIE_MODEL` |
 | 执行 | raven —— 工具在哪执行、有什么权限、怎么隔离，都由它决定 |
 
 ## 与 raven 怎么分
@@ -53,30 +53,11 @@ interface RavenClient {
 
 ## 模型怎么配
 
-**全部在数据库里，用 raven 的「模型与厂商」界面填。环境变量不参与**（2026-10-09 裁定）。
+厂商 key、协议和推理档位配在 Magpie。little-one 这边只设 `MAGPIE_MODEL`
+（Magpie 上的模型名或路由组）。会话不另存一份，raven 里也不选。
 
-三张表：`providers`（厂商 + key + 默认协议）→ `endpoints`（走哪种协议 + baseUrl）
-→ `models`（模型 id + 推理档位）。启动时幂等 seed 内置的三家厂商与端点，
-但 **key 不 seed** —— 所以刚起来一定是「未配置 key」，那是真的没配。
-
-| 想改什么 | 去哪改 |
-|---|---|
-| API key | 界面 · 厂商段 · API key 输入框 |
-| 端点地址、协议 | 界面 · 端点段 |
-| 有哪些模型可选 | 界面 · 模型段 |
-| 默认用哪个 | `models` 表的第一项（没有单独开关） |
-
-⚠️ **曾经有过 env 线路**（`OPENAI_API_KEY` / `AGENT_MODEL` / `AGENT_REASONING_EFFORT`），
-现在全删了，`providers.keyEnvVar` 那一列也没了。旧数据库启动时会**自动 `DROP COLUMN` 迁移**
-（在真有数据的库上验过：不丢数据，端点与会话都在）；只有该列被索引或外键引用而删不掉时
-才拒绝启动并报出原因。
-
-删掉的理由不是「更干净」，是**两份真相会让用户改错地方却看到「已保存」**：
-界面上填的 key 被容器注入的 env 盖掉，而提示语说的是「配置完成」。
-一份真相可以有很多呈现方式，两份真相只会让人猜哪份生效。
-
-模型清单不在代码里硬编码 —— 列一份与实际端点不符的清单比不列更糟：
-用户会选了才发现用不了。
+旧库启动时会删掉 `providers` / `endpoints` / `models`，并去掉会话上的
+`endpointId` / `modelId`。会话行留下。token 预算仍在 `PUT /api/config/budget`。
 
 ---
 
@@ -99,7 +80,7 @@ interface RavenClient {
 
 ```bash
 npm install
-cp .env.example .env            # 填 AGENT_RUNTIME_TOKEN（至少 16 字符）与模型 key
+cp .env.example .env            # 填 AGENT_RUNTIME_TOKEN（至少 16 字符）与 MAGPIE_MODEL
 npm run dev                     # http://127.0.0.1:5900
 ```
 
@@ -119,7 +100,8 @@ curl -s localhost:5900/healthz | jq
 src/
 ├── main.ts          进程入口（含 unhandledRejection 兜底）
 ├── server.ts        路由 —— 每个 handler 对应契约的一节
-├── config/env.ts    部署参数（库路径/ token / 端口）。**模型配置不在这里**
+├── config/env.ts    部署参数（库路径 / token / 端口）
+├── upstream.ts      Magpie 地址、调用 token、MAGPIE_MODEL
 ├── agent/loop.ts    Agent Loop：SDK 的流 → 契约的八个事件
 ├── tools/
 │   ├── registry.ts  工具定义、风险、JSON Schema 导出
@@ -132,7 +114,7 @@ src/
     ├── sse.ts       SSE 封装。事件形状就是契约
     └── turn.ts      一轮对话的编排
 docs/
-├── 01-contract.md   v1 冻结契约
+├── 01-contract.md   v2 契约
 └── 03-known-gaps.md v1 明确不做的事，以及后果
 ```
 
@@ -220,13 +202,13 @@ npm run verify              # 下面前四组
 npm run verify:purity       # 协议层不许 import SDK（机器检查，9 个文件）
 npm run verify:protocol     # 组 A 协议层：编排 / 审批 / 上下文重建        28 条
 npm run verify:driver       # 组 B Vercel AI Adapter：翻译正确性          31 条
-npm run verify:registry     # 组 C 目录层：厂商 → 端点(协议) → 模型        19 条
+npm run verify:registry     # 库里没有模型目录
 
 npm run verify:gateway      # raven 的反向 gateway：鉴权 / 沙箱 / 写操作被拒 15 条
 npm run verify:stream       # SSE 事件形状与终止保证（需要先起服务）        14 条
 ```
 
-**换一家 SDK 时：组 A 一行不用改，只有组 B 重写。** 组 C 完全不动。
+**换一家 SDK 时：组 A 一行不用改，只有组 B 重写。**
 分层理由与三条纪律见 `docs/02-architecture.md`。
 
 ---
